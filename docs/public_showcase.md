@@ -54,10 +54,11 @@
 
 - `docs/assets/system-architecture.png`
 - `docs/assets/home-workbench.png`
-- `docs/assets/job-cards.jpg`
+- `docs/assets/job-cards.png`
 - `docs/assets/market-cards.png`
 
 说明：
 
 - public 展示仓库的可视化部分只使用这几张实际截图
 - 不再额外加入其他示意图，避免展示素材和真实界面脱节
+- 卡片展示图当前统一使用 `job-cards.png`，不再保留旧的 `job-cards.jpg`

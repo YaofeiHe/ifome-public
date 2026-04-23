@@ -129,7 +129,7 @@
 
 - `docs/assets/system-architecture.png`
 - `docs/assets/home-workbench.png`
-- `docs/assets/job-cards.jpg`
+- `docs/assets/job-cards.png`
 - `docs/assets/market-cards.png`
 - `docs/public_showcase.md`
 

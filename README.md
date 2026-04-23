@@ -30,7 +30,7 @@
 
 ### 求职活动卡片
 
-![ifome job cards](docs/assets/job-cards.jpg)
+![ifome job cards](docs/assets/job-cards.png)
 
 ### 市场信息卡片
 
