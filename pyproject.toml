@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifome-job-agent"
+version = "0.1.0"
+description = "Job information flow agent POC scaffold."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "pydantic",
+  "langgraph",
+  "python-multipart",
+]
+
+[project.scripts]
+ifome = "core.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "httpx",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "apps*", "integrations*"]
+
+[tool.setuptools.package-data]
+"apps.web" = [
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "next.config.mjs",
+  "next-env.d.ts",
+  "README.md",
+  "app/**/*.ts",
+  "app/**/*.tsx",
+  "app/**/*.css",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

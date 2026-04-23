@@ -1,0 +1,3 @@
+include README.md
+include public_sync_manifest.txt
+recursive-include apps/web *.ts *.tsx *.css *.json *.mjs *.d.ts *.md
