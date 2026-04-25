@@ -104,12 +104,21 @@ button {
 .dashboard-grid {
   display: grid;
   gap: 20px;
+  width: 100%;
+  min-width: 0;
 }
 
 .memory-page-shell {
-  width: 100%;
+  width: min(100%, 1180px);
+  max-width: 1180px;
+  margin: 0 auto;
+  min-width: 0;
   display: grid;
   gap: 20px;
+}
+
+.memory-page-shell > * {
+  min-width: 0;
 }
 
 .hero,
@@ -171,6 +180,11 @@ h2 {
   display: grid;
   gap: 20px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.memory-grid > * {
+  min-width: 0;
 }
 
 .workspace-card {
