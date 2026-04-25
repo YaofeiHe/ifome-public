@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from datetime import datetime
 
@@ -35,21 +36,174 @@ ROLE_CANDIDATES = [
 ]
 
 
+@dataclass(frozen=True)
+class RuleClassificationAssessment:
+    """Rule-first category assessment used to decide whether LLM fallback is needed."""
+
+    category: ContentCategory
+    confidence: float
+    reasons: list[str]
+    candidate_scores: dict[str, float]
+    should_consult_llm: bool
+
+
+def assess_classification(
+    normalized_text: str,
+    *,
+    source_metadata: dict | None = None,
+) -> RuleClassificationAssessment:
+    """Score the most likely content category before deciding whether to use LLM."""
+
+    metadata = source_metadata or {}
+    lowered = normalized_text.lower()
+    text_length = len(re.sub(r"\s+", "", normalized_text))
+    scores = {
+        ContentCategory.JOB_POSTING: 0.0,
+        ContentCategory.INTERVIEW_NOTICE: 0.0,
+        ContentCategory.TALK_EVENT: 0.0,
+        ContentCategory.REFERRAL: 0.0,
+        ContentCategory.GENERAL_UPDATE: 0.0,
+        ContentCategory.NOISE: 0.0,
+        ContentCategory.UNKNOWN: 0.1,
+    }
+    reasons: list[str] = []
+
+    interview_hits = _keyword_hits(
+        lowered,
+        ("面试", "笔试", "oa", "线上面试", "一面", "二面", "三面", "终面", "测评"),
+    )
+    talk_hits = _keyword_hits(
+        lowered,
+        ("宣讲", "双选会", "招聘会", "说明会", "宣讲会", "分享会"),
+    )
+    referral_hits = _keyword_hits(
+        lowered,
+        ("内推", "内推码", "内推链接", "官方内推", "推荐码"),
+    )
+    job_hits = _keyword_hits(
+        lowered,
+        (
+            "招聘",
+            "岗位",
+            "岗位职责",
+            "任职要求",
+            "工作地点",
+            "投递",
+            "网申",
+            "apply",
+            "jd",
+            "岗位上新",
+            "hc",
+        ),
+    )
+    general_hits = _keyword_hits(
+        lowered,
+        (
+            "趋势",
+            "动态",
+            "进展",
+            "整体进度",
+            "经验贴",
+            "总结",
+            "汇总",
+            "建议",
+            "市场",
+            "赛道",
+            "融资",
+            "发布",
+            "上线",
+            "开源",
+        ),
+    )
+
+    if interview_hits:
+        scores[ContentCategory.INTERVIEW_NOTICE] += min(0.9, 0.32 + interview_hits * 0.18)
+        reasons.append("detected interview-style timing or round keywords")
+    if talk_hits:
+        scores[ContentCategory.TALK_EVENT] += min(0.86, 0.3 + talk_hits * 0.18)
+        reasons.append("detected talk-event keywords")
+    if referral_hits:
+        scores[ContentCategory.REFERRAL] += min(0.92, 0.36 + referral_hits * 0.18)
+        reasons.append("detected referral-specific keywords")
+    if job_hits:
+        scores[ContentCategory.JOB_POSTING] += min(0.9, 0.26 + job_hits * 0.14)
+        reasons.append("detected concrete job-posting keywords")
+    if general_hits:
+        scores[ContentCategory.GENERAL_UPDATE] += min(0.82, 0.24 + general_hits * 0.12)
+        reasons.append("detected trend/summary/update keywords")
+
+    if metadata.get("market_watch") or metadata.get("market_group_kind"):
+        scores[ContentCategory.GENERAL_UPDATE] += 0.32
+        reasons.append("market-watch metadata biased toward general_update")
+    if metadata.get("role_variant"):
+        scores[ContentCategory.JOB_POSTING] += 0.22
+        reasons.append("role_variant metadata indicates a concrete position")
+    if metadata.get("search_references"):
+        scores[ContentCategory.GENERAL_UPDATE] += 0.06
+        reasons.append("search references suggest information-style context")
+    if metadata.get("force_content_category"):
+        forced = ContentCategory(str(metadata["force_content_category"]))
+        scores[forced] += 0.5
+        reasons.append("source metadata already hinted the category")
+
+    if extract_role(normalized_text):
+        scores[ContentCategory.JOB_POSTING] += 0.16
+    if extract_company(normalized_text):
+        scores[ContentCategory.JOB_POSTING] += 0.1
+    if extract_url(normalized_text):
+        scores[ContentCategory.JOB_POSTING] += 0.08
+        scores[ContentCategory.REFERRAL] += 0.06
+    if "请分析" in normalized_text or "帮我看看" in normalized_text:
+        scores[ContentCategory.UNKNOWN] += 0.14
+        reasons.append("instructional phrasing keeps the intent slightly ambiguous")
+
+    if text_length < 12 and max(interview_hits, talk_hits, referral_hits, job_hits, general_hits) == 0:
+        scores[ContentCategory.NOISE] += 0.82
+        reasons.append("text is too short and lacks recruiting signals")
+    elif text_length < 30 and scores[ContentCategory.NOISE] < 0.3:
+        scores[ContentCategory.NOISE] += 0.2
+
+    if "汇总" in normalized_text and job_hits and not extract_role(normalized_text):
+        scores[ContentCategory.GENERAL_UPDATE] += 0.14
+        reasons.append("summary/collection wording weakens direct job classification")
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    top_category, top_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    confidence = max(0.0, min(0.99, top_score))
+    should_consult_llm = (
+        confidence < 0.72
+        or top_score - second_score < 0.14
+        or (
+            top_category in {ContentCategory.GENERAL_UPDATE, ContentCategory.UNKNOWN}
+            and max(
+                scores[ContentCategory.JOB_POSTING],
+                scores[ContentCategory.REFERRAL],
+                scores[ContentCategory.INTERVIEW_NOTICE],
+            )
+            >= 0.38
+        )
+    )
+
+    return RuleClassificationAssessment(
+        category=top_category,
+        confidence=confidence,
+        reasons=reasons[:5] or ["fallback heuristic classification"],
+        candidate_scores={key.value: round(value, 4) for key, value in ranked},
+        should_consult_llm=should_consult_llm,
+    )
+
+
+def _keyword_hits(text: str, keywords: tuple[str, ...]) -> int:
+    """Count distinct keyword hits for one classification bucket."""
+
+    return sum(1 for keyword in keywords if keyword in text)
+
+
 def classify_text(normalized_text: str) -> ContentCategory:
     """Classify one normalized input using simple keyword heuristics."""
 
-    text = normalized_text.lower()
-    if any(keyword in normalized_text for keyword in ["面试", "笔试", "OA", "线上面试"]):
-        return ContentCategory.INTERVIEW_NOTICE
-    if "宣讲" in normalized_text:
-        return ContentCategory.TALK_EVENT
-    if "内推" in normalized_text:
-        return ContentCategory.REFERRAL
-    if any(keyword in normalized_text for keyword in ["招聘", "岗位", "投递", "jd", "任职要求"]):
-        return ContentCategory.JOB_POSTING
-    if len(text) < 12:
-        return ContentCategory.NOISE
-    return ContentCategory.GENERAL_UPDATE
+    return assess_classification(normalized_text).category
 
 
 def extract_company(text: str) -> str | None:

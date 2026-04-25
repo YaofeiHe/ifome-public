@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import Field
 
-from core.extraction.parse import build_summary
+from core.extraction.parse import RuleClassificationAssessment, build_summary
+from core.extraction.prompt_context import PromptReference
 from core.runtime.time import now_in_project_timezone
 from core.schemas import (
     AgentState,
@@ -45,10 +47,21 @@ class LLMExtractionResult(SchemaModel):
     evidence: list[EvidenceSpan] = Field(default_factory=list)
 
 
+class LLMTitleAssessmentResult(SchemaModel):
+    """Validated JSON contract for deciding whether one job title is complete."""
+
+    is_complete_segment: bool = Field(default=True)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = Field(description="Compact explanation for the title assessment.")
+
+
 def classify_text_with_llm(
     *,
     normalized_text: str,
     source_type: SourceType,
+    source_metadata: dict[str, Any],
+    rule_assessment: RuleClassificationAssessment,
+    prompt_references: list[PromptReference],
     route: str,
     llm_gateway,
     prompt_loader: PromptLoader,
@@ -68,6 +81,20 @@ def classify_text_with_llm(
     payload = {
         "source_type": source_type.value,
         "normalized_text": normalized_text,
+        "rule_assessment": {
+            "category": rule_assessment.category.value,
+            "confidence": rule_assessment.confidence,
+            "reasons": rule_assessment.reasons,
+            "candidate_scores": rule_assessment.candidate_scores,
+        },
+        "keyword_hints": list(source_metadata.get("keyword_hints", [])),
+        "search_references": list(source_metadata.get("search_references", []))[:2],
+        "prompt_references": [reference.to_payload() for reference in prompt_references],
+        "user_hint": {
+            "force_content_category": source_metadata.get("force_content_category"),
+            "market_group_kind": source_metadata.get("market_group_kind"),
+            "relationship_tags": list(source_metadata.get("relationship_tags", []))[:6],
+        },
     }
     response = llm_gateway.complete_json(
         route=route,
@@ -81,6 +108,8 @@ def classify_text_with_llm(
 def extract_signal_with_llm(
     *,
     state: AgentState,
+    rule_extraction: dict[str, Any],
+    prompt_references: list[PromptReference],
     route: str,
     llm_gateway,
     prompt_loader: PromptLoader,
@@ -108,6 +137,17 @@ def extract_signal_with_llm(
             state.classified_category.value if state.classified_category else None
         ),
         "normalized_text": state.normalized_item.normalized_text,
+        "rule_extraction": rule_extraction,
+        "keyword_hints": list(state.source_metadata.get("keyword_hints", [])),
+        "search_references": list(state.source_metadata.get("search_references", []))[:2],
+        "prompt_references": [reference.to_payload() for reference in prompt_references],
+        "source_metadata_hints": {
+            "source_title": state.source_metadata.get("source_title"),
+            "role_variant": state.source_metadata.get("role_variant"),
+            "relationship_tags": list(state.source_metadata.get("relationship_tags", []))[:6],
+            "primary_unit": state.source_metadata.get("primary_unit"),
+            "identity_tag": state.source_metadata.get("identity_tag"),
+        },
     }
     response = llm_gateway.complete_json(
         route=route,
@@ -144,3 +184,42 @@ def extract_signal_with_llm(
         evidence=parsed.evidence,
         extracted_at=now_in_project_timezone(),
     )
+
+
+def assess_job_title_with_llm(
+    *,
+    normalized_text: str,
+    source_title: str | None,
+    source_metadata: dict[str, Any],
+    route: str,
+    llm_gateway,
+    prompt_loader: PromptLoader,
+) -> LLMTitleAssessmentResult:
+    """Judge whether one job-facing title is a complete information segment."""
+
+    prompt = prompt_loader.load("job_title_assessment")
+    system_prompt = (
+        f"{prompt}\n\n"
+        "补充约束：\n"
+        "- 只输出一个 JSON 对象，不要输出 Markdown。\n"
+        "- `is_complete_segment` 只能是 true 或 false。\n"
+        "- `confidence` 必须是 0 到 1 的小数。\n"
+        "- `reason` 用一句中文解释。"
+    )
+    response = llm_gateway.complete_json(
+        route=route,
+        task_name="job_title_assessment",
+        system_prompt=system_prompt,
+        user_payload={
+            "source_title": source_title,
+            "normalized_text": normalized_text,
+            "keyword_hints": list(source_metadata.get("keyword_hints", [])),
+            "source_metadata_hints": {
+                "primary_unit": source_metadata.get("primary_unit"),
+                "role_variant": source_metadata.get("role_variant"),
+                "identity_tag": source_metadata.get("identity_tag"),
+                "relationship_tags": list(source_metadata.get("relationship_tags", []))[:6],
+            },
+        },
+    )
+    return LLMTitleAssessmentResult.model_validate(response)

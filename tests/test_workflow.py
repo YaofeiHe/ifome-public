@@ -28,3 +28,20 @@ def test_sequential_workflow_runs_end_to_end() -> None:
     assert result.score_result is not None
     assert result.render_card is not None
     assert len(result.node_history) == 9
+
+
+def test_invoke_defaults_to_handwritten_runtime() -> None:
+    """Workflow invoke should use the handwritten sequential runtime by default."""
+
+    workflow = JobWorkflow()
+    state = create_initial_state(
+        raw_input="阿里云招聘 后端工程师，工作地点上海，投递截止 2026年05月01日 18:00。",
+        source_type=SourceType.TEXT,
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+    )
+
+    result = workflow.invoke(state)
+
+    assert result.status == WorkflowStatus.COMPLETED
+    assert result.render_card is not None

@@ -29,6 +29,9 @@ from core.schemas.memory import (
     InterviewLoopRecord,
     ProfileMemory,
     ProjectMemoryEntry,
+    ResumeStructuredProfile,
+    ResumeStructuredSection,
+    ResumeSnapshot,
 )
 from core.schemas.reminders import ReminderTask
 
@@ -50,6 +53,9 @@ __all__ = [
     "ProfileMemory",
     "ProjectMemoryEntry",
     "RecommendedAction",
+    "ResumeStructuredProfile",
+    "ResumeStructuredSection",
+    "ResumeSnapshot",
     "ReminderChannel",
     "ReminderStatus",
     "ReminderTask",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -121,6 +122,11 @@ class OpenAICompatibleLLMGateway:
                 raise LLMGatewayError(
                     f"Live LLM network error for {provider.provider_name}/{model_name}: "
                     f"{exc.reason}"
+                ) from exc
+            except (TimeoutError, socket.timeout) as exc:  # pragma: no cover - network path
+                raise LLMGatewayError(
+                    f"Live LLM timeout for {provider.provider_name}/{model_name}: "
+                    f"{exc}"
                 ) from exc
 
             try:

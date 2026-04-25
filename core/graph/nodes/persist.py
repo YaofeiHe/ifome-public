@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 
+from core.extraction.prompt_context import collect_prompt_references
 from core.graph.nodes.base import WorkflowNode
 from core.schemas import AgentState
 
@@ -155,13 +156,41 @@ class PersistNode(WorkflowNode):
         current: AgentState,
         existing: AgentState,
     ) -> tuple[float, bool, str]:
+        heuristic_score, heuristic_replace, heuristic_reason = self._heuristic_similarity_decision(
+            current=current,
+            existing=existing,
+        )
+        force_llm = self._should_force_llm_company_role_check(
+            current=current,
+            existing=existing,
+        )
         route = self.dependencies.model_router.select("deduplicate", "medium")
+        if force_llm and self.dependencies.llm_gateway.is_available(route):
+            try:
+                return self._llm_similarity_decision(
+                    current=current,
+                    existing=existing,
+                    route=route,
+                    heuristic_score=heuristic_score,
+                    heuristic_reason=f"force_llm_company_role::{heuristic_reason}",
+                )
+            except Exception:
+                return (heuristic_score, heuristic_replace, heuristic_reason)
+        if heuristic_score >= 0.82 or heuristic_score < 0.45:
+            return (heuristic_score, heuristic_replace, heuristic_reason)
+
         if self.dependencies.llm_gateway.is_available(route):
             try:
-                return self._llm_similarity_decision(current=current, existing=existing, route=route)
+                return self._llm_similarity_decision(
+                    current=current,
+                    existing=existing,
+                    route=route,
+                    heuristic_score=heuristic_score,
+                    heuristic_reason=heuristic_reason,
+                )
             except Exception:
-                pass
-        return self._heuristic_similarity_decision(current=current, existing=existing)
+                return (heuristic_score, heuristic_replace, heuristic_reason)
+        return (heuristic_score, heuristic_replace, heuristic_reason)
 
     def _llm_similarity_decision(
         self,
@@ -169,19 +198,25 @@ class PersistNode(WorkflowNode):
         current: AgentState,
         existing: AgentState,
         route: str,
+        heuristic_score: float,
+        heuristic_reason: str,
     ) -> tuple[float, bool, str]:
+        prompt = self.dependencies.prompt_loader.load("deduplicate")
+        prompt_references = self._collect_dedupe_prompt_references(
+            current=current,
+            existing=existing,
+        )
         response = self.dependencies.llm_gateway.complete_json(
             route=route,
             task_name="card_deduplicate",
-            system_prompt=(
-                "你在判断两张求职信息卡片是否属于同一核心岗位信息。"
-                "只返回 JSON。"
-                "字段：same_core(boolean), should_replace_existing(boolean), confidence(number), reason(string)。"
-                "判断标准：公司、岗位、地点、链接、时间、原文片段是否指向同一个岗位。"
-                "如果只是同一岗位的新版本，same_core=true 且 should_replace_existing=true。"
-                "如果核心信息相同且没有重要变化，same_core=true 且 should_replace_existing=false。"
-            ),
+            system_prompt=prompt,
             user_payload={
+                "heuristic_precheck": {
+                    "score": round(heuristic_score, 4),
+                    "reason": heuristic_reason,
+                },
+                "keyword_hints": self._dedupe_keyword_hints(current, existing),
+                "prompt_references": [reference.to_payload() for reference in prompt_references],
                 "current": self._state_snapshot(current),
                 "existing": self._state_snapshot(existing),
             },
@@ -265,6 +300,95 @@ class PersistNode(WorkflowNode):
         reason = ", ".join(reasons) or "heuristic similarity below threshold"
         return (min(score, 0.99), replace_existing, reason)
 
+    def _should_force_llm_company_role_check(self, current: AgentState, existing: AgentState) -> bool:
+        """Escalate directly to LLM when the pair looks like same-company similar-role ambiguity."""
+
+        current_signal = current.extracted_signal
+        existing_signal = existing.extracted_signal
+        if current_signal is None or existing_signal is None:
+            return False
+        if not current_signal.company or current_signal.company != existing_signal.company:
+            return False
+        current_role = current_signal.role or self._role_variant(current) or ""
+        existing_role = existing_signal.role or self._role_variant(existing) or ""
+        if not current_role or not existing_role:
+            return False
+        return self._role_similarity(current_role, existing_role) >= 0.45
+
+    def _role_similarity(self, left: str, right: str) -> float:
+        """Measure shallow role similarity for dedupe escalation decisions."""
+
+        left_tokens = self._tokenize(left)
+        right_tokens = self._tokenize(right)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        overlap = len(left_tokens & right_tokens)
+        return overlap / max(len(left_tokens), len(right_tokens))
+
+    def _collect_dedupe_prompt_references(
+        self,
+        *,
+        current: AgentState,
+        existing: AgentState,
+    ):
+        """Assemble retrieval-backed prompt context for LLM dedupe decisions."""
+
+        normalized = current.normalized_item
+        if normalized is None:
+            return []
+        source_metadata = {
+            **current.source_metadata,
+            "keyword_hints": self._dedupe_keyword_hints(current, existing),
+            "primary_unit": current.extracted_signal.company if current.extracted_signal else None,
+            "role_variant": current.extracted_signal.role if current.extracted_signal else None,
+        }
+        query_text = " ".join(
+            part
+            for part in [
+                normalized.normalized_text[:240],
+                existing.normalized_item.normalized_text[:240]
+                if existing.normalized_item is not None
+                else "",
+                current.extracted_signal.company if current.extracted_signal else "",
+                current.extracted_signal.role if current.extracted_signal else "",
+                existing.extracted_signal.role if existing.extracted_signal else "",
+            ]
+            if part
+        )
+        return collect_prompt_references(
+            user_id=current.user_id,
+            workspace_id=current.workspace_id,
+            current_item_id=normalized.id,
+            query_text=query_text,
+            source_metadata=source_metadata,
+            workflow_repository=self.dependencies.workflow_repository,
+            search_client=None,
+            embedding_gateway=self.dependencies.embedding_gateway,
+            vector_store=self.dependencies.vector_store,
+            embed_route=self.dependencies.model_router.select("embed", "low"),
+            category_hint=current.classified_category.value if current.classified_category else None,
+        )
+
+    def _dedupe_keyword_hints(self, current: AgentState, existing: AgentState) -> list[str]:
+        """Combine current and existing card keywords for dedupe prompting."""
+
+        values = [
+            *(current.source_metadata.get("keyword_hints", []) or []),
+            *(existing.source_metadata.get("keyword_hints", []) or []),
+            current.extracted_signal.company if current.extracted_signal else None,
+            current.extracted_signal.role if current.extracted_signal else None,
+            existing.extracted_signal.company if existing.extracted_signal else None,
+            existing.extracted_signal.role if existing.extracted_signal else None,
+            self._identity_tag(current),
+            self._identity_tag(existing),
+        ]
+        deduped: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in deduped:
+                deduped.append(text)
+        return deduped[:8]
+
     def _state_snapshot(self, state: AgentState) -> dict:
         signal = state.extracted_signal
         normalized = state.normalized_item
@@ -294,7 +418,10 @@ class PersistNode(WorkflowNode):
         title = normalized.source_title if normalized else state.source_metadata.get("source_title")
         if not title:
             return None
-        return self._normalize_piece(str(title))
+        normalized_title = self._normalize_piece(str(title))
+        if self._is_instructional_title(normalized_title):
+            return None
+        return normalized_title
 
     def _role_variant(self, state: AgentState) -> str | None:
         role_variant = state.source_metadata.get("role_variant")
@@ -331,3 +458,24 @@ class PersistNode(WorkflowNode):
 
     def _normalize_piece(self, value: str | None) -> str:
         return re.sub(r"\s+", "", (value or "").lower())
+
+    def _is_instructional_title(self, title: str | None) -> bool:
+        """Ignore action-only titles so they do not block duplicate merging."""
+
+        if not title:
+            return True
+        return any(
+            title.startswith(prefix)
+            for prefix in (
+                "填写内推码",
+                "内推码",
+                "网申链接",
+                "投递链接",
+                "投递方式",
+                "申请方式",
+                "官方内推投递",
+                "点击链接",
+                "链接",
+                "填写",
+            )
+        )

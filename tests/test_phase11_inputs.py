@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import apps.api.src.services as services_module
@@ -198,6 +199,35 @@ class FakeSearchClient:
                 }
             ]
         return []
+
+
+class SparseMarketWebPageClient(FakeWebPageClient):
+    """Simulate market article fetch failures so title-only fallback must create real child cards."""
+
+    def fetch(self, url: str) -> WebPageExtractionResult:
+        if url.endswith("/articles/agent-platform") or url.endswith("/articles/agent-eval"):
+            return super().fetch(url)
+        if "jiqizhixin.com/articles/" in url:
+            raise RuntimeError("正文抓取失败")
+        return super().fetch(url)
+
+
+class SparseMarketSearchClient(FakeSearchClient):
+    """Search client that returns title-only market candidates without snippets."""
+
+    def search(self, *, query: str, limit: int = 5) -> list[dict[str, str | None]]:
+        results = super().search(query=query, limit=limit)
+        if "site:jiqizhixin.com" not in query:
+            return results
+        sparse_results: list[dict[str, str | None]] = []
+        for index, result in enumerate(results):
+            sparse_results.append(
+                {
+                    **result,
+                    "snippet": None if index >= 2 else result.get("snippet"),
+                }
+            )
+        return sparse_results
 
 
 def test_ingest_link_fetches_page_text_when_raw_text_missing() -> None:
@@ -467,6 +497,49 @@ def test_refresh_market_watch_keeps_one_high_value_exploration_article(
         "具身智能机器人量产与融资进入新阶段"
         in str(state.source_metadata.get("market_article_title") or "")
         for state in article_states
+    )
+
+
+def test_refresh_market_watch_keeps_real_child_cards_when_only_titles_are_available(
+    tmp_path, monkeypatch
+) -> None:
+    """Title-only market candidates should still become persisted child cards instead of preview-only ghosts."""
+
+    monkeypatch.chdir(tmp_path)
+    services = ApiServiceContainer(
+        dependencies=WorkflowDependencies(
+            web_page_client=SparseMarketWebPageClient(),
+            search_client=SparseMarketSearchClient(),
+        )
+    )
+
+    memory_payload = services.dependencies.memory_provider.load(
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+    )
+    career_state = memory_payload["career_state_memory"].model_copy(
+        update={"market_watch_sources": ["https://www.jiqizhixin.com/"]}
+    )
+    services.upsert_career_state_memory(career_state)
+
+    refreshed, _, states, _ = services.refresh_market_watch(
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+        force=True,
+    )
+
+    assert refreshed is True
+    overview_states = [
+        state for state in states if state.render_card and state.render_card.market_group_kind == "overview"
+    ]
+    article_states = [
+        state for state in states if state.render_card and state.render_card.market_group_kind == "article"
+    ]
+    assert len(overview_states) == 1
+    assert len(article_states) == 5
+    assert all(state.render_card and state.render_card.item_id for state in article_states)
+    assert all(
+        state.render_card and state.render_card.summary_one_line for state in article_states
     )
 
 
@@ -755,6 +828,31 @@ def test_refresh_market_watch_falls_back_to_source_homepage_when_search_is_empty
     assert states[0].source_metadata.get("market_watch_fallback") == "homepage_fetch"
 
 
+def test_market_refresh_due_checks_10am_and_9pm_slots() -> None:
+    """Scheduled market refresh should be due when the latest 10:00 / 21:00 slot was missed."""
+
+    services = ApiServiceContainer()
+    morning_slot = datetime.fromisoformat("2026-04-25T10:00:00+08:00")
+    before_evening = datetime.fromisoformat("2026-04-25T20:30:00+08:00")
+    evening_slot = datetime.fromisoformat("2026-04-25T21:00:00+08:00")
+    next_morning = datetime.fromisoformat("2026-04-26T09:30:00+08:00")
+
+    assert services._market_refresh_due(None, before_evening) is True
+    assert services._market_refresh_due(
+        datetime.fromisoformat("2026-04-25T09:55:00+08:00"),
+        before_evening,
+    ) is True
+    assert services._market_refresh_due(
+        datetime.fromisoformat("2026-04-25T10:05:00+08:00"),
+        before_evening,
+    ) is False
+    assert services._market_refresh_due(
+        datetime.fromisoformat("2026-04-25T21:05:00+08:00"),
+        next_morning,
+    ) is False
+    assert services._market_refresh_due(morning_slot, evening_slot) is True
+
+
 def test_ingest_auto_splits_multi_section_submission_into_multiple_cards(tmp_path, monkeypatch) -> None:
     """Multi-position recruiting collections should split into multiple item cards."""
 
@@ -793,11 +891,12 @@ https://docs.qq.com/smartsheet/demo
     )
 
     assert analysis.input_kind == "mixed"
-    assert len(states) == 3
+    assert len(states) == 4
     titles = [state.normalized_item.source_title for state in states if state.normalized_item]
     assert any(title and "阿里系-暑期实习-阿里云" in title for title in titles)
     assert any(title and "淘宝闪购-算法工程师-生成器式方向" in title for title in titles)
     assert any(title and "淘宝闪购-数据研发工程师" in title for title in titles)
+    assert any(title and title == "阿里系-暑期实习-淘宝闪购" for title in titles)
     assert all(state.extracted_signal is not None for state in states)
     assert any("阿里系-暑期实习-淘宝闪购" in state.extracted_signal.tags for state in states)
     assert all("共享规则：" in (state.normalized_item.raw_content if state.normalized_item else "") for state in states)
@@ -807,9 +906,29 @@ https://docs.qq.com/smartsheet/demo
         state.extracted_signal and state.extracted_signal.ddl and state.extracted_signal.ddl.year == 2099
         for state in states
     )
-    assert all(state.source_metadata.get("fetch_plan") for state in states)
+    assert all(
+        state.source_metadata.get("job_group_kind") == "overview"
+        or state.source_metadata.get("fetch_plan")
+        for state in states
+    )
+    overview_state = next(
+        state for state in states if state.source_metadata.get("job_group_kind") == "overview"
+    )
+    child_states = [
+        state for state in states if state.source_metadata.get("job_group_kind") == "role"
+    ]
+    assert len(child_states) == 2
+    assert overview_state.source_metadata.get("job_child_item_ids")
+    assert overview_state.render_card is not None
+    assert overview_state.render_card.job_group_kind == "overview"
+    assert len(overview_state.render_card.job_child_item_ids) == 2
+    assert all(
+        child.source_metadata.get("job_parent_item_id") == overview_state.normalized_item.id
+        for child in child_states
+        if child.normalized_item is not None
+    )
     stored_items = services.list_items(user_id="demo_user", workspace_id="demo_workspace")
-    assert len(stored_items) == 3
+    assert len(stored_items) == 4
     assert "https://docs.qq.com/smartsheet/demo" not in web_client.calls
 
 
@@ -841,7 +960,7 @@ def test_ingest_auto_derives_platform_neutral_relationship_tags(tmp_path, monkey
         visit_links=False,
     )
 
-    assert len(states) == 2
+    assert len(states) == 3
     assert all(state.normalized_item is not None for state in states)
     assert any(
         state.normalized_item
@@ -849,8 +968,15 @@ def test_ingest_auto_derives_platform_neutral_relationship_tags(tmp_path, monkey
         and "字节系-暑期实习-抖音电商" in state.normalized_item.source_title
         for state in states
     )
+    role_states = [state for state in states if state.source_metadata.get("job_group_kind") == "role"]
+    overview_state = next(
+        state for state in states if state.source_metadata.get("job_group_kind") == "overview"
+    )
+    assert len(role_states) == 2
     assert all(state.source_metadata.get("identity_tag") == "字节系-暑期实习-抖音电商" for state in states)
     assert all("抖音电商" in state.source_metadata.get("keyword_hints", []) for state in states)
+    assert overview_state.render_card is not None
+    assert overview_state.render_card.job_group_kind == "overview"
 
 
 def test_ingest_auto_marks_location_pending_when_city_is_missing(tmp_path, monkeypatch) -> None:

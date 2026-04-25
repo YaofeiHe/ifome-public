@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import { ReactNode } from "react";
 
 import { AppNav } from "./components/app-nav";
+import { MarketRefreshBootstrap } from "./components/market-refresh-bootstrap";
 
 export const metadata: Metadata = {
   title: "ifome Job Agent",
@@ -17,6 +18,7 @@ export default function RootLayout({ children }: RootLayoutProps) {
   return (
     <html lang="zh-CN">
       <body>
+        <MarketRefreshBootstrap />
         <div className="site-shell">
           <header className="site-header">
             <div className="brand-block">

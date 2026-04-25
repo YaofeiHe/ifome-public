@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from apps.api.src.contracts import (
     ApiEnvelope,
@@ -17,6 +18,9 @@ from apps.api.src.contracts import (
     BossZhipinJobIngestRequest,
     CareerStateMemoryWriteRequest,
     ChatCitation,
+    ChatAttachmentDiagnostic,
+    ChatMemoryUpdate,
+    ChatQueryPlan,
     ChatQueryRequest,
     ChatQueryResponse,
     DeleteItemResponse,
@@ -34,6 +38,11 @@ from apps.api.src.contracts import (
     ProfileMemoryWriteRequest,
     ProjectSelfMemoryWriteRequest,
     ReminderListResponse,
+    SourceFileCleanupReport,
+    RuntimeSettingsResponse,
+    RuntimeSettingsUpdateRequest,
+    UnifiedAttachmentResult,
+    UnifiedIngestResponse,
 )
 from apps.api.src.services import (
     ApiServiceContainer,
@@ -153,6 +162,58 @@ def ingest_auto(payload: AutoIngestRequest) -> ApiEnvelope:
             visited_links=analysis.urls if analysis.should_visit_links else [],
             analysis_reasons=analysis.reasons,
             results=results,
+        ),
+        trace_id=states[0].trace_id if states else None,
+    )
+
+
+@app.post("/ingest/unified", response_model=ApiEnvelope)
+async def ingest_unified(
+    content: str = Form(""),
+    user_id: str = Form("demo_user"),
+    workspace_id: str | None = Form("demo_workspace"),
+    memory_write_mode: MemoryWriteMode = Form(MemoryWriteMode.CONTEXT_ONLY),
+    visit_links: bool | None = Form(None),
+    files: list[UploadFile] = File(default=[]),
+) -> ApiEnvelope:
+    """Process inline text, uploaded files, and local paths in one request."""
+
+    try:
+        uploaded_files = [
+            (file.filename or "upload.bin", await file.read())
+            for file in files
+        ]
+        analysis, states, attachments, resolved_paths = services.ingest_unified(
+            content=content,
+            uploaded_files=uploaded_files,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            memory_write_mode=memory_write_mode,
+            visit_links=visit_links,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    results = [
+        IngestResult(
+            item_id=state.normalized_item.id if state.normalized_item else None,
+            status=state.status.value,
+            card=state.render_card,
+            reminder_count=len(state.reminder_tasks),
+            model_routing=state.model_routing,
+        )
+        for state in states
+    ]
+    return _ok(
+        UnifiedIngestResponse(
+            detected_input_kind=analysis.input_kind,
+            visited_links=analysis.urls if analysis.should_visit_links else [],
+            analysis_reasons=analysis.reasons,
+            results=results,
+            attachments=[
+                UnifiedAttachmentResult(**attachment) for attachment in attachments
+            ],
+            resolved_local_paths=resolved_paths,
         ),
         trace_id=states[0].trace_id if states else None,
     )
@@ -279,6 +340,17 @@ def get_item(item_id: str) -> ApiEnvelope:
     return _ok(ItemDetailResponse(item=state), trace_id=state.trace_id)
 
 
+@app.get("/items/{item_id}/source-file")
+def get_item_source_file(item_id: str) -> FileResponse:
+    """Return one archived local source file for direct access."""
+
+    source_file = services.get_source_file(item_id)
+    if source_file is None:
+        raise HTTPException(status_code=404, detail=f"Source file for item {item_id} not found.")
+    file_path, file_name = source_file
+    return FileResponse(path=file_path, filename=file_name)
+
+
 @app.patch("/items/{item_id}", response_model=ApiEnvelope)
 def update_item(item_id: str, payload: ItemUpdateRequest) -> ApiEnvelope:
     """Apply a manual edit to one stored card."""
@@ -355,6 +427,95 @@ def list_reminders() -> ApiEnvelope:
     return _ok(ReminderListResponse(reminders=services.list_reminders()))
 
 
+@app.get("/settings/runtime", response_model=ApiEnvelope)
+def get_runtime_settings() -> ApiEnvelope:
+    """Return local runtime settings isolated from long-term memory."""
+
+    return _ok(RuntimeSettingsResponse(**services.get_runtime_settings()))
+
+
+@app.post("/settings/runtime", response_model=ApiEnvelope)
+def update_runtime_settings(payload: RuntimeSettingsUpdateRequest) -> ApiEnvelope:
+    """Persist local runtime settings and refresh runtime-bound clients."""
+
+    settings_snapshot = services.update_runtime_settings(
+        llm_enabled=payload.llm.enabled,
+        llm_api_key=payload.llm.api_key,
+        llm_base_url=payload.llm.base_url,
+        llm_model=payload.llm.model,
+        llm_fallback_models=payload.llm.fallback_models,
+        llm_request_timeout_seconds=payload.llm.request_timeout_seconds,
+        ocr_enabled=payload.ocr.enabled,
+        ocr_provider_label=payload.ocr.provider_label,
+        ocr_api_key=payload.ocr.api_key,
+        ocr_base_url=payload.ocr.base_url,
+        ocr_model=payload.ocr.model,
+        ocr_request_timeout_seconds=payload.ocr.request_timeout_seconds,
+        source_files_max_age_days=payload.source_files.max_age_days,
+        source_files_max_total_size_mb=payload.source_files.max_total_size_mb,
+        source_files_delete_when_item_deleted=payload.source_files.delete_when_item_deleted,
+        source_files_filter_patterns=payload.source_files.filter_patterns,
+    )
+    return _ok(RuntimeSettingsResponse(**settings_snapshot))
+
+
+@app.post("/settings/source-files/cleanup", response_model=ApiEnvelope)
+def cleanup_source_files() -> ApiEnvelope:
+    """Run one manual source-file cleanup pass using current retention rules."""
+
+    return _ok(SourceFileCleanupReport(**services.cleanup_source_files(trigger="manual")))
+
+
+@app.get("/memory", response_model=ApiEnvelope)
+def get_memory_snapshot(
+    user_id: str = "demo_user",
+    workspace_id: str | None = "demo_workspace",
+) -> ApiEnvelope:
+    """Return the current profile and career-state memory snapshot."""
+
+    profile, career = services.get_memory_snapshot(
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    return _ok(MemoryResponse(profile_memory=profile, career_state_memory=career))
+
+
+@app.get("/memory/profile/resume-file")
+def get_profile_resume_file(
+    user_id: str = "demo_user",
+    workspace_id: str | None = "demo_workspace",
+) -> FileResponse:
+    """Return the archived resume source file stored in profile memory."""
+
+    source_file = services.get_resume_source_file(
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    if source_file is None:
+        raise HTTPException(status_code=404, detail="Resume source file not found.")
+    file_path, file_name = source_file
+    return FileResponse(path=file_path, filename=file_name)
+
+
+@app.get("/memory/profile/project-file")
+def get_profile_project_file(
+    project_name: str,
+    user_id: str = "demo_user",
+    workspace_id: str | None = "demo_workspace",
+) -> FileResponse:
+    """Return one archived project source file stored in profile memory."""
+
+    source_file = services.get_project_source_file(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        project_name=project_name,
+    )
+    if source_file is None:
+        raise HTTPException(status_code=404, detail="Project source file not found.")
+    file_path, file_name = source_file
+    return FileResponse(path=file_path, filename=file_name)
+
+
 @app.post("/memory/profile", response_model=ApiEnvelope)
 def upsert_profile_memory(payload: ProfileMemoryWriteRequest) -> ApiEnvelope:
     """Replace profile memory for one user scope."""
@@ -428,17 +589,19 @@ def refresh_market(payload: MarketRefreshRequest) -> ApiEnvelope:
 def chat_query(payload: ChatQueryRequest) -> ApiEnvelope:
     """Answer one minimal follow-up question grounded in stored workflow data."""
 
-    answer, supporting_item_ids, citations, retrieval_mode = services.chat_query(
+    result = services.chat_query_enhanced(
         query=payload.query,
         user_id=payload.user_id,
         workspace_id=payload.workspace_id,
         item_id=payload.item_id,
         recent_days=payload.recent_days,
+        apply_memory_updates=payload.apply_memory_updates,
+        uploaded_files=[],
     )
     return _ok(
         ChatQueryResponse(
-            answer=answer,
-            supporting_item_ids=supporting_item_ids,
+            answer=result.answer,
+            supporting_item_ids=result.supporting_item_ids,
             citations=[
                 ChatCitation(
                     doc_id=citation.doc_id,
@@ -447,9 +610,119 @@ def chat_query(payload: ChatQueryRequest) -> ApiEnvelope:
                     snippet=citation.snippet,
                     score=round(citation.score, 4),
                 )
-                for citation in citations
+                for citation in result.citations
             ],
-            retrieval_mode=retrieval_mode,
+            retrieval_mode=result.retrieval_mode,
+            query_plan=ChatQueryPlan(
+                intent=result.query_analysis.intent,
+                search_hints=list(result.query_analysis.search_hints),
+                rewritten_query=result.query_analysis.rewritten_query,
+                retrieval_queries=list(result.query_analysis.retrieval_queries),
+                web_search_queries=list(result.query_analysis.web_search_queries),
+                profile_update_hints=list(result.query_analysis.profile_update_hints),
+                career_update_hints=list(result.query_analysis.career_update_hints),
+                should_update_memory=result.query_analysis.should_update_memory,
+                needs_resume=result.query_analysis.needs_resume,
+                recent_days=result.query_analysis.recent_days,
+            ),
+            memory_update=ChatMemoryUpdate(
+                applied=result.memory_update.applied,
+                profile_fields=result.memory_update.profile_fields,
+                career_fields=result.memory_update.career_fields,
+                notes=result.memory_update.notes,
+            ),
+            attachments=[
+                ChatAttachmentDiagnostic(
+                    display_name=attachment.display_name,
+                    source_ref=attachment.source_ref,
+                    extraction_kind=attachment.extraction_kind,
+                    attachment_kind=attachment.attachment_kind,
+                    summary=attachment.summary,
+                    persisted_to_profile=attachment.persisted_to_profile,
+                    text_length=attachment.text_length,
+                    processing_error=attachment.processing_error,
+                )
+                for attachment in result.attachments
+            ],
+        )
+    )
+
+
+@app.post("/chat/query-unified", response_model=ApiEnvelope)
+async def chat_query_unified(
+    query: str = Form(""),
+    user_id: str = Form("demo_user"),
+    workspace_id: str | None = Form("demo_workspace"),
+    item_id: str | None = Form(None),
+    recent_days: int = Form(30),
+    apply_memory_updates: bool = Form(True),
+    files: list[UploadFile] = File(default=[]),
+) -> ApiEnvelope:
+    """Answer one chat query that may include uploaded files or local file paths."""
+
+    try:
+        uploaded_files = [
+            (file.filename or "upload.bin", await file.read())
+            for file in files
+        ]
+        result = services.chat_query_enhanced(
+            query=query,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            item_id=item_id,
+            recent_days=recent_days,
+            apply_memory_updates=apply_memory_updates,
+            uploaded_files=uploaded_files,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _ok(
+        ChatQueryResponse(
+            answer=result.answer,
+            supporting_item_ids=result.supporting_item_ids,
+            citations=[
+                ChatCitation(
+                    doc_id=citation.doc_id,
+                    item_id=citation.item_id,
+                    source_label=citation.source_label,
+                    snippet=citation.snippet,
+                    score=round(citation.score, 4),
+                )
+                for citation in result.citations
+            ],
+            retrieval_mode=result.retrieval_mode,
+            query_plan=ChatQueryPlan(
+                intent=result.query_analysis.intent,
+                search_hints=list(result.query_analysis.search_hints),
+                rewritten_query=result.query_analysis.rewritten_query,
+                retrieval_queries=list(result.query_analysis.retrieval_queries),
+                web_search_queries=list(result.query_analysis.web_search_queries),
+                profile_update_hints=list(result.query_analysis.profile_update_hints),
+                career_update_hints=list(result.query_analysis.career_update_hints),
+                should_update_memory=result.query_analysis.should_update_memory,
+                needs_resume=result.query_analysis.needs_resume,
+                recent_days=result.query_analysis.recent_days,
+            ),
+            memory_update=ChatMemoryUpdate(
+                applied=result.memory_update.applied,
+                profile_fields=result.memory_update.profile_fields,
+                career_fields=result.memory_update.career_fields,
+                notes=result.memory_update.notes,
+            ),
+            attachments=[
+                ChatAttachmentDiagnostic(
+                    display_name=attachment.display_name,
+                    source_ref=attachment.source_ref,
+                    extraction_kind=attachment.extraction_kind,
+                    attachment_kind=attachment.attachment_kind,
+                    summary=attachment.summary,
+                    persisted_to_profile=attachment.persisted_to_profile,
+                    text_length=attachment.text_length,
+                    processing_error=attachment.processing_error,
+                )
+                for attachment in result.attachments
+            ],
         )
     )
 

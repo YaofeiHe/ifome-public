@@ -40,6 +40,72 @@ class ProjectMemoryEntry(SchemaModel):
         default_factory=list,
         description="Talking points that can later feed interview preparation prompts.",
     )
+    source_file_name: str | None = Field(
+        default=None,
+        description="Archived source file name when the project entry came from an uploaded file.",
+    )
+    source_file_path: str | None = Field(
+        default=None,
+        description="Archived local source path used for direct download from the memory page.",
+    )
+
+class ResumeStructuredSection(SchemaModel):
+    """One user-facing structured resume section for the memory page."""
+
+    title: str = Field(description="Section title such as education or projects.")
+    items: list[str] = Field(
+        default_factory=list,
+        description="Ordered bullet-like items rendered on the resume web view.",
+    )
+
+
+class ResumeStructuredProfile(SchemaModel):
+    """Structured resume representation suitable for UI rendering and downstream reuse."""
+
+    headline: str | None = Field(
+        default=None,
+        description="Compact headline describing the overall resume focus.",
+    )
+    sections: list[ResumeStructuredSection] = Field(
+        default_factory=list,
+        description="Resume sections rendered in the memory management page.",
+    )
+
+
+class ResumeSnapshot(SchemaModel):
+    """One persisted resume snapshot extracted from chat uploads or manual updates."""
+
+    file_name: str | None = Field(
+        default=None,
+        description="Original resume file name when available.",
+    )
+    source_file_name: str | None = Field(
+        default=None,
+        description="Archived source file name used for direct download from the memory page.",
+    )
+    source_file_path: str | None = Field(
+        default=None,
+        description="Archived local source path used by the dedicated resume file endpoint.",
+    )
+    text: str = Field(description="Raw extracted resume text kept for grounded chat and review.")
+    summary: str | None = Field(
+        default=None,
+        description="Compact resume summary used for UI display and retrieval hints.",
+    )
+    structured_profile: ResumeStructuredProfile | None = Field(
+        default=None,
+        description="Structured resume view rendered in the memory management page.",
+    )
+    updated_at: datetime = Field(
+        description="Timezone-aware timestamp when the resume snapshot was last updated."
+    )
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_timestamps(cls, value: datetime, info) -> datetime:
+        """Require timezone-aware resume snapshot timestamps."""
+
+        return ensure_timezone_aware(value, info.field_name)
 
 
 class HardFilter(SchemaModel):
@@ -78,6 +144,10 @@ class ProfileMemory(UserScopedModel):
         default_factory=list,
         description="Skills that help the matcher assess relevance.",
     )
+    persona_keywords: list[str] = Field(
+        default_factory=list,
+        description="Compact user self-description keywords collected from grounded chats.",
+    )
     projects: list[ProjectMemoryEntry] = Field(
         default_factory=list,
         description="Project summaries that later support matching and interview prep.",
@@ -101,6 +171,10 @@ class ProfileMemory(UserScopedModel):
     summary: str | None = Field(
         default=None,
         description="Human-readable profile summary suitable for debugging and UI display.",
+    )
+    resume_snapshot: ResumeSnapshot | None = Field(
+        default=None,
+        description="Latest grounded resume snapshot uploaded through chat or memory flows.",
     )
     updated_at: datetime = Field(
         description="Timezone-aware timestamp when the profile memory was last updated."

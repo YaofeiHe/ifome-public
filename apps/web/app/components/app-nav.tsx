@@ -8,6 +8,7 @@ const navItems = [
   { href: "/ingest", label: "输入页" },
   { href: "/items", label: "卡片列表" },
   { href: "/memory", label: "记忆管理" },
+  { href: "/settings", label: "模型设置" },
   { href: "/chat", label: "聊天控制台" },
 ];
 

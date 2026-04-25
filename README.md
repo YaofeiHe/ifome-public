@@ -38,10 +38,12 @@
 
 ## 当前完成度
 
-- 已完成统一输入：文本、链接、OCR
+- 已完成统一输入：文本、链接、图片 OCR、PDF/文本文件上传、本地路径解析
 - 已完成显式工作流：normalize / classify / extract / score / reminder_plan / render
 - 已完成 SQLite 持久化、卡片去重和更新覆盖
 - 已完成用户画像、动态求职状态和 grounded chat / RAG
+- 已完成聊天控制台双模式：grounded chat + Boss / HR 回复模拟
+- 已完成简历、项目说明上传后的结构化画像沉淀与源文件回看
 - 已完成市场信息刷新、大卡片 / 小卡片组织、批量卡片操作
 - 已完成 `pip install -e .` 与 `ifome` 一键启动
 - 已完成公共同步与一键推送脚本
@@ -55,7 +57,7 @@
 
 ## 技术栈
 
-- Backend: FastAPI, Pydantic, LangGraph-compatible workflow layer
+- Backend: FastAPI, Pydantic, handwritten runtime first + LangGraph-compatible workflow layer
 - Frontend: Next.js, React, TypeScript
 - Storage: SQLite
 - Retrieval: Qdrant-compatible vector layer + app-level RAG orchestration
@@ -114,7 +116,7 @@ ifome/
 
 - `apps/`：可以独立启动和对外交互的应用层，比如 API 服务和 Web 前端。它更像系统的“壳”，负责接请求、返回页面、暴露接口。
 - `core/`：项目核心业务层，负责定义状态、业务规则、工作流节点、记忆、打分、提醒和聊天策略。它决定系统“怎么工作”。
-- `core/runtime/`：运行时抽象层，负责回答“这些节点由谁按什么顺序执行”。当前会先兼容 LangGraph，后续可以替换成手写 Runtime，而不重写 `core` 里的业务语义。
+- `core/runtime/`：运行时抽象层，负责回答“这些节点由谁按什么顺序执行”。当前默认走手写顺序 Runtime，LangGraph 只保留为兼容层和 POC 参考。
 
 ## 核心模块
 
@@ -130,10 +132,11 @@ ifome/
 
 主要用户入口：
 
-- `/ingest`：输入文本、链接、截图
+- `/ingest`：统一输入文本、链接、截图、PDF/文本文件和本地路径
 - `/items`：查看求职活动和市场信息卡片
-- `/memory`：维护长期画像、动态状态和市场关注源
-- `/chat`：基于已有卡片继续提问
+- `/memory`：维护长期画像、动态状态、项目画像、简历资料和市场关注源
+- `/settings`：维护通用 LLM 与独立 OCR LLM 的本地运行设置
+- `/chat`：基于已有卡片继续提问，或切换到 Boss / HR 回复模拟
 
 主要 API：
 

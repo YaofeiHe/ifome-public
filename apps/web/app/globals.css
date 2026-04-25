@@ -106,6 +106,12 @@ button {
   gap: 20px;
 }
 
+.memory-page-shell {
+  width: 100%;
+  display: grid;
+  gap: 20px;
+}
+
 .hero,
 .panel {
   background: var(--surface);
@@ -225,6 +231,50 @@ h2 {
   gap: 16px;
 }
 
+.composer-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.chat-simulator {
+  display: grid;
+  gap: 14px;
+}
+
+.chat-bubble {
+  padding: 18px 20px;
+  border-radius: 22px;
+  border: 1px solid rgba(74, 55, 24, 0.12);
+}
+
+.chat-bubble p {
+  margin: 0;
+}
+
+.chat-bubble-boss {
+  justify-self: start;
+  max-width: min(760px, 88%);
+  background: rgba(249, 243, 231, 0.94);
+}
+
+.chat-bubble-agent {
+  justify-self: end;
+  max-width: min(820px, 92%);
+  background:
+    linear-gradient(180deg, rgba(255, 252, 246, 0.96), rgba(245, 233, 209, 0.9));
+}
+
+.chat-bubble-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
 .field {
   display: grid;
   gap: 8px;
@@ -238,6 +288,7 @@ h2 {
 .field input,
 .field textarea,
 .field select {
+  min-width: 0;
   width: 100%;
   border: 1px solid rgba(78, 56, 18, 0.18);
   border-radius: 18px;
@@ -245,11 +296,29 @@ h2 {
   padding: 14px 16px;
   color: var(--text);
   resize: vertical;
+  overflow-wrap: anywhere;
 }
 
 .source-table-shell {
   display: grid;
   gap: 12px;
+}
+
+.attachment-list {
+  display: grid;
+  gap: 10px;
+}
+
+.attachment-chip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(249, 243, 231, 0.92);
+  border: 1px solid rgba(74, 55, 24, 0.1);
 }
 
 .source-table-header,
@@ -462,6 +531,14 @@ h2 {
   line-height: 1.7;
 }
 
+.memory-secondary-panel {
+  width: 100%;
+}
+
+.memory-snapshot-box {
+  max-width: 100%;
+}
+
 .routing-box pre,
 .detail-panel pre {
   white-space: pre-wrap;
@@ -496,6 +573,126 @@ h2 {
   color: var(--success);
 }
 
+.nested-panel {
+  padding: 0;
+  box-shadow: none;
+}
+
+.settings-list {
+  display: grid;
+  gap: 14px;
+}
+
+.settings-section {
+  border: 1px solid rgba(78, 56, 18, 0.12);
+  border-radius: 22px;
+  background: rgba(255, 250, 242, 0.88);
+  overflow: hidden;
+}
+
+.settings-toggle {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  padding: 20px 22px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.settings-toggle-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.settings-toggle-meta {
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+
+.settings-body {
+  display: grid;
+  gap: 18px;
+  padding: 0 22px 22px;
+  border-top: 1px solid rgba(78, 56, 18, 0.08);
+}
+
+.settings-note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.settings-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-grid-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.settings-card {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(249, 243, 231, 0.92);
+  border: 1px solid rgba(74, 55, 24, 0.1);
+}
+
+.settings-card h2 {
+  margin-bottom: 2px;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.secondary-button {
+  border: 1px solid rgba(165, 74, 27, 0.2);
+  border-radius: 18px;
+  padding: 14px 18px;
+  background: rgba(165, 74, 27, 0.08);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.secondary-button:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.settings-report {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(74, 55, 24, 0.08);
+}
+
+.settings-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.settings-stats span {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(119, 88, 39, 0.08);
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
 .error-banner,
 .error-text {
   color: var(--danger);
@@ -517,6 +714,7 @@ h2 {
   .toolbar-panel,
   .workspace-grid,
   .memory-grid,
+  .settings-grid,
   .card-grid,
   .site-header {
     grid-template-columns: 1fr;

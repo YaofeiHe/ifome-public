@@ -16,6 +16,8 @@
 - 招聘文本
 - 招聘链接
 - 截图 / OCR
+- PDF / 文本文件
+- 本地图片或文件路径
 - Boss 直聘岗位详情
 - Boss 直聘 HR 对话
 
@@ -130,11 +132,13 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 
 ### 第二步：录入求职信息
 
-打开 `/ingest`，可以提交：
+打开 `/ingest`，现在只需要一个统一输入框，可以提交：
 
 - 一段文本
-- 一个链接
+- 一个或多个链接
 - 一张图片
+- 一个 PDF 或文本文件
+- 一行本地图片 / 文件路径
 
 适合录入的内容包括：
 
@@ -168,6 +172,9 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 - 会检索项目经历
 - 会检索动态求职状态
 - 会返回引用来源
+- 会先做 Query Rewrite、多路检索扩词和 Prompt 拼装
+- 上传简历或项目说明时会先总结文件主要内容，再把结果写入画像
+- 可切换到“模拟 Boss 回复”模式，把对方消息渲染成对话框并一键复制建议回复
 
 ## 当前主要页面
 
@@ -182,6 +189,14 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 - 文本
 - 链接
 - 图片文件
+- PDF / 文本文件
+- 单独占一行的本地路径
+
+补充说明：
+
+- 输入产生的原始文本、上传图片、上传文件和本地路径副本会统一归档到 `data/runtime/source_files/`
+- 直接输入的文本会存成 `.txt`
+- 卡片列表和详情页会提供“访问源文件”入口
 
 ### `/items`
 
@@ -194,10 +209,25 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 作用：
 
 - 编辑长期画像和当前求职状态
+- 查看聊天上传后自动整理的项目画像与简历资料
+- 直接打开已归档的简历或项目源文件
+
+### `/settings`
+
+作用：
+
+- 配置通用推理 LLM
+- 配置独立 OCR LLM（Qwen-VL-OCR）
+- 与长期 memory 隔离保存本地运行时设置
 
 ### `/chat`
 
 作用：
+
+- 在统一输入框里兼容提问、上传简历、上传项目说明、上传聊天截图
+- 输出 grounded 回答
+- 保守更新长期画像和动态状态
+- 模拟 Boss / HR 沟通回复
 
 - 基于已有条目和 memory 继续追问
 

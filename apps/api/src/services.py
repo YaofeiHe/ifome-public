@@ -5,17 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+import shutil
+import subprocess
 import re
+import tempfile
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from core.chat import RAGChatService
+from core.chat import QueryAnalysis, RAGChatService, RAGDocument, RetrievedContext
+from core.extraction.prompt_context import collect_prompt_references
 from core.extraction.parse import extract_all_datetimes, extract_city, pick_next_datetime
 from core.graph import JobWorkflow, create_initial_state
 from core.memory.experimental import ProjectSelfMemoryPayload, ProjectSelfMemoryService
-from core.runtime.dependencies import WorkflowDependencies
-from core.runtime.settings import AppSettings
+from core.runtime.dependencies import StaticModelRouter, WorkflowDependencies
+from core.runtime.settings import (
+    AppSettings,
+    RuntimeOCROverrides,
+    RuntimeProviderOverrides,
+    RuntimeSourceFileOverrides,
+    RuntimeSettingsOverrides,
+)
 from core.runtime.time import now_in_project_timezone
 from core.schemas import (
     AgentState,
@@ -25,10 +35,28 @@ from core.schemas import (
     MemoryWriteMode,
     PriorityLevel,
     ProfileMemory,
+    ProjectMemoryEntry,
+    ResumeStructuredProfile,
+    ResumeStructuredSection,
+    ResumeSnapshot,
     RenderedItemCard,
     SourceType,
 )
-from core.tools import LLMGatewayError, fetch_recent_site_titles
+from core.storage.runtime_settings import LocalRuntimeSettingsRepository
+from core.tools import (
+    CascadingOCRClient,
+    DocumentTextExtractionResult,
+    GeneralLLMOCRClient,
+    LLMGatewayError,
+    LocalTesseractOCRClient,
+    NoopLLMGateway,
+    NoopSearchClient,
+    OpenAICompatibleLLMGateway,
+    QwenVLOCRClient,
+    WebSearchClient,
+    build_ocr_client_from_settings,
+    fetch_recent_site_titles,
+)
 from integrations.boss_zhipin import (
     BossZhipinConversationPayload,
     BossZhipinJobPayload,
@@ -55,6 +83,21 @@ NON_SECTION_BRACKET_TITLES = {
     "岗位要求",
     "投递方式",
 }
+NON_SECTION_ACTION_PREFIXES = (
+    "填写内推码",
+    "内推码",
+    "网申链接",
+    "投递链接",
+    "投递方式",
+    "申请方式",
+    "官方内推投递",
+    "点击链接",
+    "链接地址",
+    "链接",
+    "扫码投递",
+    "扫码申请",
+    "立即投递",
+)
 SEARCH_INSTRUCTION_PATTERNS = (
     "请在网页上搜索",
     "请先搜索",
@@ -107,6 +150,110 @@ MARKET_VALUE_KEYWORDS = (
     "自动驾驶",
     "多模态",
 )
+IMAGE_FILE_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+}
+TEXT_FILE_SUFFIXES = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".json",
+    ".csv",
+    ".log",
+    ".yaml",
+    ".yml",
+}
+DOCUMENT_FILE_SUFFIXES = TEXT_FILE_SUFFIXES | {".pdf"}
+SOURCE_ARCHIVE_ROOT = Path("data/runtime/source_files")
+RESUME_FILE_NAME_PATTERN = re.compile(r"(resume|cv|简历)", re.IGNORECASE)
+RESUME_SECTION_MARKERS = (
+    "教育经历",
+    "项目经历",
+    "实习经历",
+    "工作经历",
+    "校园经历",
+    "技能",
+    "专业技能",
+    "自我评价",
+)
+PROJECT_FILE_NAME_PATTERN = re.compile(
+    r"(project|项目|prd|设计|架构|方案|readme|说明)",
+    re.IGNORECASE,
+)
+PROJECT_SECTION_MARKERS = (
+    "项目背景",
+    "项目简介",
+    "项目说明",
+    "项目经历",
+    "技术栈",
+    "系统设计",
+    "系统架构",
+    "职责",
+    "负责",
+    "难点",
+    "亮点",
+    "成果",
+)
+KNOWN_LOCATION_TERMS = (
+    "上海",
+    "北京",
+    "杭州",
+    "深圳",
+    "广州",
+    "苏州",
+    "成都",
+    "南京",
+    "武汉",
+    "西安",
+    "远程",
+)
+KNOWN_SKILL_TERMS = (
+    "Python",
+    "Java",
+    "C++",
+    "Go",
+    "Rust",
+    "TypeScript",
+    "JavaScript",
+    "FastAPI",
+    "Django",
+    "Flask",
+    "React",
+    "Next.js",
+    "Vue",
+    "PyTorch",
+    "TensorFlow",
+    "SQL",
+    "MySQL",
+    "PostgreSQL",
+    "Redis",
+    "Docker",
+    "Kubernetes",
+    "Linux",
+    "RAG",
+    "Agent",
+    "MCP",
+    "LangGraph",
+    "LLM",
+    "NLP",
+    "多模态",
+    "向量检索",
+    "知识库",
+)
+CHAT_INTENT_PRIORITY_LABELS = {
+    "deadline_planning": "跟进近期 DDL",
+    "resume_polish": "简历润色",
+    "interview_prep": "面试准备",
+    "hr_reply": "沟通话术准备",
+    "job_targeting": "高匹配岗位筛选",
+}
 
 
 @dataclass(frozen=True)
@@ -137,6 +284,55 @@ class SubmissionSection:
 
 
 @dataclass(frozen=True)
+class ExtractedAttachment:
+    """One attachment or local file converted into analyzable text."""
+
+    display_name: str
+    source_ref: str
+    source_type: SourceType
+    text: str
+    source_metadata: dict[str, Any]
+    extraction_kind: str
+
+
+@dataclass(frozen=True)
+class ChatAttachmentResult:
+    """One chat-specific attachment prepared for retrieval and optional memory writes."""
+
+    display_name: str
+    source_ref: str
+    extraction_kind: str
+    attachment_kind: str
+    summary: str
+    persisted_to_profile: bool
+    text_length: int
+    processing_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ChatMemoryUpdateSummary:
+    """Conservative profile and career updates applied during one chat turn."""
+
+    applied: bool
+    profile_fields: list[str] = field(default_factory=list)
+    career_fields: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ChatExecutionResult:
+    """Rich chat result returned to the API layer for UI inspection."""
+
+    answer: str
+    supporting_item_ids: list[str]
+    citations: list[RetrievedContext]
+    retrieval_mode: str
+    query_analysis: QueryAnalysis
+    memory_update: ChatMemoryUpdateSummary
+    attachments: list[ChatAttachmentResult] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class MarketArticleCandidate:
     """One title-level market article candidate before or after正文抓取."""
 
@@ -155,6 +351,16 @@ class MarketArticleCandidate:
     published_at: str | None = None
 
 
+@dataclass(frozen=True)
+class JobCardRelationshipDecision:
+    """One LLM decision about how two job cards relate within the same company context."""
+
+    relation: str
+    confidence: float
+    reason: str
+    group_title: str | None = None
+
+
 @dataclass
 class ApiServiceContainer:
     """
@@ -171,16 +377,141 @@ class ApiServiceContainer:
 
     dependencies: WorkflowDependencies = field(default_factory=WorkflowDependencies)
     settings: AppSettings = field(default_factory=AppSettings.from_env)
+    runtime_settings_repository: LocalRuntimeSettingsRepository = field(
+        default_factory=lambda: LocalRuntimeSettingsRepository(
+            Path("data/runtime/runtime_settings.json")
+        )
+    )
     project_self_memory_service: ProjectSelfMemoryService = field(
         default_factory=ProjectSelfMemoryService
     )
 
     def __post_init__(self) -> None:
+        self.runtime_overrides = self.runtime_settings_repository.load()
+        self.settings = AppSettings.from_env(self.runtime_overrides)
+        self._refresh_runtime_bindings()
+
+    def _refresh_runtime_bindings(self) -> None:
+        """Refresh runtime-bound clients after local settings change."""
+
+        self.dependencies.model_router = StaticModelRouter(self.settings)
+        if isinstance(
+            self.dependencies.llm_gateway,
+            (OpenAICompatibleLLMGateway, NoopLLMGateway),
+        ):
+            if self.settings.llm.enable_live_llm:
+                self.dependencies.llm_gateway = OpenAICompatibleLLMGateway(self.settings.llm)
+            else:
+                self.dependencies.llm_gateway = NoopLLMGateway()
+
+        if isinstance(self.dependencies.search_client, (WebSearchClient, NoopSearchClient)):
+            if self.settings.llm.enable_live_llm or self.settings.rag.enable_live_rag:
+                self.dependencies.search_client = WebSearchClient()
+            else:
+                self.dependencies.search_client = NoopSearchClient()
+
+        if isinstance(
+            self.dependencies.ocr_client,
+            (
+                CascadingOCRClient,
+                GeneralLLMOCRClient,
+                LocalTesseractOCRClient,
+                QwenVLOCRClient,
+            ),
+        ):
+            self.dependencies.ocr_client = build_ocr_client_from_settings(self.settings)
+
         self.workflow = JobWorkflow(self.dependencies)
         self.chat_service = RAGChatService(
             dependencies=self.dependencies,
             settings=self.settings,
         )
+
+    def get_runtime_settings(self) -> dict[str, Any]:
+        """Return the current runtime settings snapshot used by the local app."""
+
+        return {
+            "llm": {
+                "enabled": self.settings.llm.enable_live_llm,
+                "api_key": self.settings.llm.dashscope.api_key,
+                "base_url": self.settings.llm.dashscope.base_url,
+                "model": self.settings.llm.dashscope.model,
+                "fallback_models": list(self.settings.llm.dashscope.fallback_models),
+                "request_timeout_seconds": self.settings.llm.request_timeout_seconds,
+            },
+            "ocr": {
+                "enabled": self.settings.ocr.enabled,
+                "provider_label": self.settings.ocr.provider_label,
+                "api_key": self.settings.ocr.api_key,
+                "base_url": self.settings.ocr.base_url,
+                "model": self.settings.ocr.model,
+                "request_timeout_seconds": self.settings.ocr.request_timeout_seconds,
+            },
+            "source_files": {
+                "max_age_days": self.settings.source_files.max_age_days,
+                "max_total_size_mb": self.settings.source_files.max_total_size_mb,
+                "delete_when_item_deleted": self.settings.source_files.delete_when_item_deleted,
+                "filter_patterns": list(self.settings.source_files.filter_patterns),
+            },
+        }
+
+    def update_runtime_settings(
+        self,
+        *,
+        llm_enabled: bool,
+        llm_api_key: str | None,
+        llm_base_url: str | None,
+        llm_model: str | None,
+        llm_fallback_models: list[str],
+        llm_request_timeout_seconds: int,
+        ocr_enabled: bool,
+        ocr_provider_label: str,
+        ocr_api_key: str | None,
+        ocr_base_url: str | None,
+        ocr_model: str | None,
+        ocr_request_timeout_seconds: int,
+        source_files_max_age_days: int,
+        source_files_max_total_size_mb: int,
+        source_files_delete_when_item_deleted: bool,
+        source_files_filter_patterns: list[str],
+    ) -> dict[str, Any]:
+        """Persist local runtime settings and refresh bound clients."""
+
+        self.runtime_overrides = RuntimeSettingsOverrides(
+            llm=RuntimeProviderOverrides(
+                enabled=llm_enabled,
+                api_key=llm_api_key,
+                base_url=llm_base_url,
+                model=llm_model,
+                fallback_models=tuple(
+                    item.strip() for item in llm_fallback_models if item.strip()
+                ),
+            ),
+            ocr=RuntimeOCROverrides(
+                enabled=ocr_enabled,
+                provider_label=ocr_provider_label.strip() or "Qwen-VL-OCR",
+                api_key=ocr_api_key,
+                base_url=ocr_base_url,
+                model=ocr_model,
+                request_timeout_seconds=ocr_request_timeout_seconds,
+            ),
+            source_files=RuntimeSourceFileOverrides(
+                max_age_days=source_files_max_age_days,
+                max_total_size_mb=source_files_max_total_size_mb,
+                delete_when_item_deleted=source_files_delete_when_item_deleted,
+                filter_patterns=tuple(
+                    item.strip()
+                    for item in source_files_filter_patterns
+                    if item.strip()
+                ),
+            ),
+            llm_request_timeout_seconds=llm_request_timeout_seconds,
+        )
+        self.runtime_settings_repository.save(self.runtime_overrides)
+        self.settings = AppSettings.from_env(self.runtime_overrides)
+        self._refresh_runtime_bindings()
+        self.cleanup_source_files(trigger="settings_update")
+        return self.get_runtime_settings()
 
     def ingest(
         self,
@@ -195,6 +526,13 @@ class ApiServiceContainer:
     ) -> AgentState:
         """Run the workflow for one input and return the full workflow state."""
 
+        source_metadata = dict(source_metadata or {})
+        source_ref, source_metadata = self._ensure_source_artifact(
+            raw_input=raw_input,
+            source_type=source_type,
+            source_ref=source_ref,
+            source_metadata=source_metadata,
+        )
         initial_state = create_initial_state(
             raw_input=raw_input,
             source_type=source_type,
@@ -202,17 +540,684 @@ class ApiServiceContainer:
             workspace_id=workspace_id,
             source_ref=source_ref,
             memory_write_mode=memory_write_mode,
-            source_metadata=source_metadata or {},
+            source_metadata=source_metadata,
         )
-        final_state = self.workflow.invoke(initial_state, prefer_langgraph=True)
+        final_state = self.workflow.invoke(initial_state, prefer_langgraph=False)
 
         # The graph follows `persist -> render` to match the design doc. After the
         # workflow finishes, we refresh the repository with the final rendered
         # state so read APIs can expose the latest card payload.
         if final_state.normalized_item is not None:
             self.dependencies.workflow_repository.save(final_state)
+            if not source_metadata.get("skip_relationship_reorg"):
+                final_state = self._maybe_reorganize_company_job_cards(final_state)
 
         return final_state
+
+    def _maybe_reorganize_company_job_cards(self, state: AgentState) -> AgentState:
+        """Use LLM relation checks to organize same-company cards into overview/child structure."""
+
+        if not self._should_run_dynamic_job_grouping(state):
+            return state
+
+        related_states = self._dedupe_states_by_item_id(self._list_related_company_cards(state))
+        if not related_states:
+            return state
+
+        grouped_members, relationship_checks, group_title_votes = self._collect_job_relationship_cluster(
+            anchor_state=state,
+            candidate_states=[state, *related_states[:8]],
+        )
+        state.source_metadata["job_relationship_checks"] = relationship_checks
+        if len(grouped_members) < 2:
+            self.dependencies.workflow_repository.save(state)
+            return state
+
+        unique_members = self._dedupe_states_by_item_id(grouped_members)
+        group_title = self._pick_job_group_title(unique_members, group_title_votes)
+        if not group_title:
+            return state
+
+        overview_state = self._upsert_dynamic_job_group_overview(
+            anchor_state=state,
+            child_states=unique_members,
+            group_title=group_title,
+        )
+        self._refresh_stale_job_overviews(
+            user_id=state.user_id,
+            workspace_id=state.workspace_id,
+            keep_parent_id=overview_state.normalized_item.id if overview_state.normalized_item else None,
+        )
+        self.dependencies.workflow_repository.save(state)
+        return state
+
+    def _collect_job_relationship_cluster(
+        self,
+        *,
+        anchor_state: AgentState,
+        candidate_states: list[AgentState],
+    ) -> tuple[list[AgentState], list[dict[str, Any]], list[str]]:
+        """Expand from the new card across same-company candidates to collect one related cluster."""
+
+        states = self._dedupe_states_by_item_id(candidate_states)
+        if len(states) < 2 or anchor_state.normalized_item is None:
+            return [anchor_state], [], []
+
+        states_by_id = {
+            state.normalized_item.id: state
+            for state in states
+            if state.normalized_item is not None
+        }
+        anchor_id = anchor_state.normalized_item.id
+        if anchor_id not in states_by_id:
+            return [anchor_state], [], []
+
+        relationship_checks: list[dict[str, Any]] = []
+        group_title_votes: list[str] = []
+        connected_ids: set[str] = {anchor_id}
+        frontier: list[str] = [anchor_id]
+        checked_pairs: set[tuple[str, str]] = set()
+        adjacency: dict[str, set[str]] = {item_id: set() for item_id in states_by_id}
+
+        while frontier:
+            current_id = frontier.pop(0)
+            current_state = states_by_id[current_id]
+            for other_id, other_state in states_by_id.items():
+                if other_id == current_id:
+                    continue
+                pair_key = tuple(sorted((current_id, other_id)))
+                if pair_key in checked_pairs:
+                    continue
+                checked_pairs.add(pair_key)
+                try:
+                    decision = self._assess_job_card_relationship(current_state, other_state)
+                except Exception:
+                    continue
+                relationship_checks.append(
+                    {
+                        "left_item_id": current_id,
+                        "right_item_id": other_id,
+                        "relation": decision.relation,
+                        "confidence": round(decision.confidence, 4),
+                        "reason": decision.reason,
+                        "group_title": decision.group_title,
+                    }
+                )
+                if not self._is_group_relationship(decision):
+                    continue
+                adjacency[current_id].add(other_id)
+                adjacency[other_id].add(current_id)
+                if decision.group_title:
+                    group_title_votes.append(decision.group_title)
+                if other_id not in connected_ids:
+                    connected_ids.add(other_id)
+                    frontier.append(other_id)
+                if current_id not in connected_ids:
+                    connected_ids.add(current_id)
+                    frontier.append(current_id)
+
+        grouped_members = [states_by_id[item_id] for item_id in states_by_id if item_id in connected_ids]
+        grouped_members.sort(
+            key=lambda candidate: 0
+            if candidate.normalized_item and candidate.normalized_item.id == anchor_id
+            else 1
+        )
+        return grouped_members, relationship_checks, group_title_votes
+
+    def _is_group_relationship(self, decision: JobCardRelationshipDecision) -> bool:
+        """Return whether one relationship decision should place cards in the same overview cluster."""
+
+        return decision.relation in {"parallel", "subordinate", "parent"}
+
+    def _should_run_dynamic_job_grouping(self, state: AgentState) -> bool:
+        """Restrict dynamic job grouping to newly ingested activity cards."""
+
+        if state.normalized_item is None or state.extracted_signal is None:
+            return False
+        if state.source_metadata.get("job_group_kind") == "overview":
+            return False
+        if state.source_metadata.get("market_watch"):
+            return False
+        if state.persistence_summary.get("dedupe_action"):
+            return False
+        return state.extracted_signal.category in {
+            ContentCategory.JOB_POSTING,
+            ContentCategory.REFERRAL,
+        }
+
+    def _list_related_company_cards(self, state: AgentState) -> list[AgentState]:
+        """Fetch stored non-market job cards from the same company or business line."""
+
+        current_signal = state.extracted_signal
+        if state.normalized_item is None or current_signal is None:
+            return []
+
+        current_company = self._relationship_company_name(state)
+        current_identity = str(state.source_metadata.get("identity_tag") or "").strip()
+        current_primary_unit = str(state.source_metadata.get("primary_unit") or "").strip()
+        current_role = str(current_signal.role or state.source_metadata.get("role_variant") or "").strip()
+
+        related: list[AgentState] = []
+        for existing in self.dependencies.workflow_repository.list_all(
+            user_id=state.user_id,
+            workspace_id=state.workspace_id,
+        ):
+            if existing.normalized_item is None or existing.extracted_signal is None:
+                continue
+            if existing.normalized_item.id == state.normalized_item.id:
+                continue
+            if existing.source_metadata.get("market_watch"):
+                continue
+            if existing.source_metadata.get("job_group_kind") == "overview":
+                continue
+            existing_company = self._relationship_company_name(existing)
+            existing_identity = str(existing.source_metadata.get("identity_tag") or "").strip()
+            existing_primary_unit = str(existing.source_metadata.get("primary_unit") or "").strip()
+            if current_company and existing_company and current_company == existing_company:
+                related.append(existing)
+                continue
+            if current_identity and existing_identity and current_identity == existing_identity:
+                related.append(existing)
+                continue
+            if current_primary_unit and existing_primary_unit and current_primary_unit == existing_primary_unit:
+                related.append(existing)
+                continue
+            if self._state_references_target_entity(
+                existing=existing,
+                company=current_company,
+                role=current_role,
+            ):
+                related.append(existing)
+        return related
+
+    def _assess_job_card_relationship(
+        self,
+        current: AgentState,
+        existing: AgentState,
+    ) -> JobCardRelationshipDecision:
+        """Use one LLM step to judge whether two same-company cards should share one overview."""
+
+        route = self.dependencies.model_router.select("deduplicate", "medium")
+        if not self.dependencies.llm_gateway.is_available(route):
+            return JobCardRelationshipDecision(relation="none", confidence=0.0, reason="llm_unavailable")
+
+        keyword_hints = self._relationship_keyword_hints(current, existing)
+        prompt_references = collect_prompt_references(
+            user_id=current.user_id,
+            workspace_id=current.workspace_id,
+            current_item_id=current.normalized_item.id if current.normalized_item else None,
+            query_text=self._relationship_query_text(current, existing),
+            source_metadata={
+                **current.source_metadata,
+                "keyword_hints": keyword_hints,
+                "primary_unit": current.extracted_signal.company if current.extracted_signal else None,
+                "role_variant": current.extracted_signal.role if current.extracted_signal else None,
+            },
+            workflow_repository=self.dependencies.workflow_repository,
+            search_client=None,
+            embedding_gateway=self.dependencies.embedding_gateway,
+            vector_store=self.dependencies.vector_store,
+            embed_route=self.dependencies.model_router.select("embed", "low"),
+            category_hint=current.classified_category.value if current.classified_category else None,
+        )
+        prompt = self.dependencies.prompt_loader.load("job_card_relationship")
+        response = self.dependencies.llm_gateway.complete_json(
+            route=route,
+            task_name="job_card_relationship",
+            system_prompt=prompt,
+            user_payload={
+                "keyword_hints": keyword_hints,
+                "prompt_references": [reference.to_payload() for reference in prompt_references],
+                "current": self._job_relationship_snapshot(current),
+                "existing": self._job_relationship_snapshot(existing),
+                "current_entity_candidates": self._reconstruct_job_card_entities(current),
+                "existing_entity_candidates": self._reconstruct_job_card_entities(existing),
+                "related_existing_cards": self._collect_related_job_context(
+                    current=current,
+                    existing=existing,
+                ),
+            },
+        )
+        relation = str(response.get("relation") or "none").strip().lower()
+        if relation not in {"none", "parallel", "subordinate", "parent"}:
+            relation = "none"
+        return JobCardRelationshipDecision(
+            relation=relation,
+            confidence=max(0.0, min(float(response.get("confidence") or 0.0), 1.0)),
+            reason=str(response.get("reason") or "job_card_relationship"),
+            group_title=str(response.get("group_title") or "").strip() or None,
+        )
+
+    def _job_relationship_snapshot(self, state: AgentState) -> dict[str, Any]:
+        """Serialize one job card into a compact relationship-judgment payload."""
+
+        signal = state.extracted_signal
+        normalized = state.normalized_item
+        return {
+            "item_id": normalized.id if normalized else None,
+            "source_title": normalized.source_title if normalized else None,
+            "summary_one_line": signal.summary_one_line if signal else None,
+            "company": self._relationship_company_name(state),
+            "role": signal.role if signal else None,
+            "city": signal.city if signal else None,
+            "ddl": signal.ddl.isoformat() if signal and signal.ddl else None,
+            "source_ref": state.source_ref,
+            "primary_unit": state.source_metadata.get("primary_unit"),
+            "identity_tag": state.source_metadata.get("identity_tag"),
+            "relationship_tags": list(state.source_metadata.get("relationship_tags", []))[:8],
+            "normalized_text": normalized.normalized_text[:500] if normalized else None,
+        }
+
+    def _relationship_query_text(self, current: AgentState, existing: AgentState) -> str:
+        """Build a retrieval query covering both cards and their core fields."""
+
+        values = [
+            current.normalized_item.normalized_text[:240] if current.normalized_item else "",
+            existing.normalized_item.normalized_text[:240] if existing.normalized_item else "",
+            current.extracted_signal.company if current.extracted_signal else "",
+            current.extracted_signal.role if current.extracted_signal else "",
+            existing.extracted_signal.role if existing.extracted_signal else "",
+            current.source_metadata.get("identity_tag"),
+            existing.source_metadata.get("identity_tag"),
+        ]
+        return " ".join(str(value).strip() for value in values if str(value or "").strip())
+
+    def _relationship_keyword_hints(self, current: AgentState, existing: AgentState) -> list[str]:
+        """Combine both cards' company, department, role and tag hints."""
+
+        values = [
+            *(current.source_metadata.get("keyword_hints", []) or []),
+            *(existing.source_metadata.get("keyword_hints", []) or []),
+            current.extracted_signal.company if current.extracted_signal else None,
+            current.extracted_signal.role if current.extracted_signal else None,
+            existing.extracted_signal.company if existing.extracted_signal else None,
+            existing.extracted_signal.role if existing.extracted_signal else None,
+            current.source_metadata.get("primary_unit"),
+            existing.source_metadata.get("primary_unit"),
+            current.source_metadata.get("identity_tag"),
+            existing.source_metadata.get("identity_tag"),
+        ]
+        deduped: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in deduped:
+                deduped.append(text)
+        return deduped[:10]
+
+    def _relationship_company_name(self, state: AgentState) -> str:
+        """Choose the company-like field that is safest for relationship grouping."""
+
+        candidates = [
+            str(state.extracted_signal.company if state.extracted_signal else "").strip(),
+            str(state.source_metadata.get("primary_unit") or "").strip(),
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if candidate.startswith("-"):
+                continue
+            if any(
+                keyword in candidate
+                for keyword in ("工程师", "分析师", "经理", "研究员", "运营", "设计师")
+            ):
+                continue
+            return candidate
+        return next((candidate for candidate in candidates if candidate), "")
+
+    def _state_references_target_entity(
+        self,
+        *,
+        existing: AgentState,
+        company: str,
+        role: str,
+    ) -> bool:
+        """Detect whether one older ambiguous card may still mention the target company/role."""
+
+        if not company and not role:
+            return False
+        for candidate in self._reconstruct_job_card_entities(existing):
+            candidate_company = str(candidate.get("company") or "").strip()
+            candidate_role = str(candidate.get("role") or "").strip()
+            if company and candidate_company and candidate_company == company:
+                return True
+            if role and candidate_role and self._role_similarity(candidate_role, role) >= 0.45:
+                return True
+        return False
+
+    def _role_similarity(self, left: str, right: str) -> float:
+        """Measure shallow role overlap for multi-entity relationship filtering."""
+
+        left_tokens = {
+            token
+            for token in re.findall(r"[A-Za-z0-9_+-]+|[\u4e00-\u9fff]{1,4}", left.lower())
+            if token
+        }
+        right_tokens = {
+            token
+            for token in re.findall(r"[A-Za-z0-9_+-]+|[\u4e00-\u9fff]{1,4}", right.lower())
+            if token
+        }
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
+
+    def _collect_related_job_context(
+        self,
+        *,
+        current: AgentState,
+        existing: AgentState,
+    ) -> list[dict[str, Any]]:
+        """Provide nearby old-card summaries so LLM can reconstruct wider overview logic."""
+
+        current_company = str(
+            current.extracted_signal.company if current.extracted_signal else ""
+        ).strip()
+        current_role = str(
+            current.extracted_signal.role or current.source_metadata.get("role_variant") or ""
+            if current.extracted_signal is not None
+            else current.source_metadata.get("role_variant") or ""
+        ).strip()
+
+        related_context: list[dict[str, Any]] = []
+        for state in self.dependencies.workflow_repository.list_all(
+            user_id=current.user_id,
+            workspace_id=current.workspace_id,
+        ):
+            if state.normalized_item is None or state.extracted_signal is None:
+                continue
+            if existing.normalized_item and state.normalized_item.id == existing.normalized_item.id:
+                continue
+            if current.normalized_item and state.normalized_item.id == current.normalized_item.id:
+                continue
+            if state.source_metadata.get("market_watch"):
+                continue
+            if state.source_metadata.get("job_group_kind") == "overview":
+                continue
+            if not self._state_references_target_entity(
+                existing=state,
+                company=current_company,
+                role=current_role,
+            ):
+                continue
+            related_context.append(
+                {
+                    "item_id": state.normalized_item.id,
+                    "source_title": state.normalized_item.source_title,
+                    "summary_one_line": state.extracted_signal.summary_one_line,
+                    "company": state.extracted_signal.company,
+                    "role": state.extracted_signal.role,
+                    "identity_tag": state.source_metadata.get("identity_tag"),
+                    "entity_candidates": self._reconstruct_job_card_entities(state),
+                }
+            )
+        return related_context[:4]
+
+    def _reconstruct_job_card_entities(self, state: AgentState) -> list[dict[str, Any]]:
+        """Rebuild multi-entity candidates from one old card's title, metadata and raw section text."""
+
+        normalized = state.normalized_item
+        signal = state.extracted_signal
+        if normalized is None:
+            return []
+
+        source_metadata = state.source_metadata or {}
+        raw_text = str(
+            source_metadata.get("original_section_text")
+            or source_metadata.get("shared_context")
+            or normalized.raw_content
+            or normalized.normalized_text
+            or ""
+        )
+        source_title = str(normalized.source_title or source_metadata.get("source_title") or "").strip()
+        keyword_hints = [
+            str(value).strip()
+            for value in source_metadata.get("keyword_hints", [])
+            if str(value).strip()
+        ]
+
+        role_candidates: list[str] = []
+        for value in [
+            signal.role if signal is not None else None,
+            source_metadata.get("role_variant"),
+            *self._extract_role_variants(raw_text),
+        ]:
+            text = str(value or "").strip("：: ;；")
+            if not text or text in role_candidates:
+                continue
+            if any(keyword in text for keyword in ("工程师", "分析师", "经理", "研究员", "运营", "设计师")):
+                role_candidates.append(text)
+
+        company_candidates: list[str] = []
+        semantic_tags = [str(value).strip() for value in source_metadata.get("semantic_tags", []) if str(value).strip()]
+        for value in [
+            signal.company if signal is not None else None,
+            source_metadata.get("primary_unit"),
+            self._extract_primary_unit(title=source_title, keyword_hints=keyword_hints),
+            *semantic_tags,
+        ]:
+            text = str(value or "").strip("：: -")
+            if not text or text in company_candidates:
+                continue
+            if text in SEASON_TAGS or text.endswith("系") or "-" in text:
+                continue
+            if any(keyword in text for keyword in ("工程师", "分析师", "经理", "研究员", "运营", "设计师")):
+                continue
+            company_candidates.append(text)
+
+        if not company_candidates and signal is not None and signal.company:
+            company_candidates.append(signal.company)
+        if not role_candidates and signal is not None and signal.role:
+            role_candidates.append(signal.role)
+
+        candidates: list[dict[str, Any]] = []
+        if company_candidates and role_candidates:
+            for company_value in company_candidates[:3]:
+                for role_value in role_candidates[:4]:
+                    candidates.append(
+                        {
+                            "company": company_value,
+                            "role": role_value,
+                            "identity_tag": source_metadata.get("identity_tag"),
+                        }
+                    )
+        else:
+            candidates.append(
+                {
+                    "company": company_candidates[0] if company_candidates else (signal.company if signal else None),
+                    "role": role_candidates[0] if role_candidates else (signal.role if signal else None),
+                    "identity_tag": source_metadata.get("identity_tag"),
+                }
+            )
+
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for candidate in candidates:
+            key = (
+                str(candidate.get("company") or "").strip(),
+                str(candidate.get("role") or "").strip(),
+                str(candidate.get("identity_tag") or "").strip(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped[:6]
+
+    def _dedupe_states_by_item_id(self, states: list[AgentState]) -> list[AgentState]:
+        """Keep one state per item id while preserving original order."""
+
+        deduped: list[AgentState] = []
+        seen: set[str] = set()
+        for state in states:
+            if state.normalized_item is None:
+                continue
+            item_id = state.normalized_item.id
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            deduped.append(state)
+        return deduped
+
+    def _pick_job_group_title(self, child_states: list[AgentState], title_votes: list[str]) -> str | None:
+        """Choose one stable overview title for a dynamically grouped company cluster."""
+
+        cleaned_votes = [title.strip() for title in title_votes if title and title.strip()]
+        if cleaned_votes:
+            counts: dict[str, int] = {}
+            for title in cleaned_votes:
+                counts[title] = counts.get(title, 0) + 1
+            return max(counts.items(), key=lambda item: item[1])[0]
+
+        anchor = child_states[0] if child_states else None
+        if anchor is None or anchor.extracted_signal is None:
+            return None
+        company = str(anchor.extracted_signal.company or anchor.source_metadata.get("primary_unit") or "").strip()
+        identity_tag = str(anchor.source_metadata.get("identity_tag") or "").strip()
+        primary_unit = str(anchor.source_metadata.get("primary_unit") or "").strip()
+        return identity_tag or primary_unit or (f"{company}-岗位合集" if company else None)
+
+    def _upsert_dynamic_job_group_overview(
+        self,
+        *,
+        anchor_state: AgentState,
+        child_states: list[AgentState],
+        group_title: str,
+    ) -> AgentState:
+        """Create or update one overview card for a same-company relation cluster."""
+
+        unique_children = self._dedupe_states_by_item_id(child_states)
+        section = SubmissionSection(
+            section_title=group_title,
+            section_text=self._compose_dynamic_job_group_text(group_title, unique_children),
+            urls=[
+                child.source_ref
+                for child in unique_children
+                if child.source_ref and URL_PATTERN.match(str(child.source_ref))
+            ][:8],
+            semantic_tags=self._dynamic_job_group_tags(unique_children, group_title),
+            role_variants=[],
+            relationship_family=str(anchor_state.source_metadata.get("relationship_family") or "").strip() or None,
+            relationship_stage=str(anchor_state.source_metadata.get("relationship_stage") or "").strip() or None,
+            primary_unit=str(
+                anchor_state.extracted_signal.company
+                or anchor_state.source_metadata.get("primary_unit")
+                or ""
+            ).strip()
+            or None,
+            identity_tag=group_title,
+        )
+        shared_exam_dates = [
+            child.extracted_signal.ddl
+            for child in unique_children
+            if child.extracted_signal is not None and child.extracted_signal.ddl is not None
+        ]
+        next_shared_exam_date = min(shared_exam_dates) if shared_exam_dates else None
+        base_source_metadata = {
+            **anchor_state.source_metadata,
+            "skip_relationship_reorg": True,
+            "source_title": group_title,
+            "source_kind": anchor_state.source_type.value,
+        }
+        return self._build_job_group_overview_state(
+            section=section,
+            child_states=unique_children,
+            shared_context="同公司/同业务线卡片经过关系判断后自动组织为岗位合集。",
+            shared_exam_dates=shared_exam_dates,
+            next_shared_exam_date=next_shared_exam_date,
+            keyword_hints=self._dynamic_job_group_tags(unique_children, group_title),
+            search_references=[],
+            user_id=anchor_state.user_id,
+            workspace_id=anchor_state.workspace_id,
+            memory_write_mode=anchor_state.memory_write_mode,
+            base_source_metadata=base_source_metadata,
+            source_type_override=SourceType.LINK if section.urls else SourceType.TEXT,
+            source_ref_override=section.urls[0] if section.urls else None,
+        )
+
+    def _compose_dynamic_job_group_text(self, group_title: str, child_states: list[AgentState]) -> str:
+        """Build synthetic overview raw text for dynamically organized company clusters."""
+
+        lines = [
+            f"岗位合集主题：{group_title}",
+            f"岗位数量：{len(child_states)}",
+            "说明：这些卡片在入库后被识别为同公司下的并列或从属岗位信息。",
+            "岗位子项：",
+        ]
+        for child in child_states[:10]:
+            summary = (
+                child.render_card.summary_one_line
+                if child.render_card is not None
+                else child.extracted_signal.summary_one_line if child.extracted_signal is not None else None
+            )
+            if summary:
+                lines.append(f"- {summary}")
+        return "\n".join(lines)
+
+    def _dynamic_job_group_tags(self, child_states: list[AgentState], group_title: str) -> list[str]:
+        """Build overview tags from grouped company, department and role hints."""
+
+        values = ["岗位合集", group_title]
+        for child in child_states:
+            values.extend(child.source_metadata.get("relationship_tags", [])[:4])
+            if child.extracted_signal is not None:
+                values.extend(
+                    [
+                        child.extracted_signal.company,
+                        child.extracted_signal.role,
+                        child.extracted_signal.city,
+                    ]
+                )
+        deduped: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in deduped:
+                deduped.append(text)
+        return deduped[:10]
+
+    def _refresh_stale_job_overviews(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None,
+        keep_parent_id: str | None,
+    ) -> None:
+        """Refresh or delete overview cards whose child links changed after regrouping."""
+
+        all_states = self.dependencies.workflow_repository.list_all(
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        parent_to_children: dict[str, list[AgentState]] = {}
+        for state in all_states:
+            if state.source_metadata.get("job_group_kind") != "role":
+                continue
+            parent_id = str(state.source_metadata.get("job_parent_item_id") or "").strip()
+            if not parent_id:
+                continue
+            current = parent_to_children.get(parent_id, [])
+            current.append(state)
+            parent_to_children[parent_id] = current
+
+        for state in all_states:
+            if state.source_metadata.get("job_group_kind") != "overview" or state.normalized_item is None:
+                continue
+            parent_id = state.normalized_item.id
+            if keep_parent_id and parent_id == keep_parent_id:
+                continue
+            child_states = parent_to_children.get(parent_id, [])
+            if len(child_states) < 2:
+                self.dependencies.workflow_repository.delete(parent_id)
+                for child in child_states:
+                    child.source_metadata["job_group_kind"] = None
+                    child.source_metadata["job_parent_item_id"] = None
+                    child.source_metadata["job_child_item_ids"] = []
+                    child.source_metadata["job_child_previews"] = []
+                    if child.render_card is not None:
+                        child.render_card.job_group_kind = None
+                        child.render_card.job_parent_item_id = None
+                        child.render_card.job_child_item_ids = []
+                        child.render_card.job_child_previews = []
+                    self.dependencies.workflow_repository.save(child)
 
     def ingest_link(
         self,
@@ -252,9 +1257,21 @@ class ApiServiceContainer:
         workspace_id: str | None,
         memory_write_mode: MemoryWriteMode = MemoryWriteMode.CONTEXT_ONLY,
         visit_links: bool | None = None,
+        source_type_override: SourceType | None = None,
+        source_ref_override: str | None = None,
+        base_source_metadata: dict[str, Any] | None = None,
     ) -> tuple[SubmissionAnalysis, list[AgentState]]:
         """Analyze mixed pasted input and fan out into one or more workflow runs."""
 
+        base_source_metadata = dict(base_source_metadata or {})
+        if not base_source_metadata.get("archived_source_path") and content.strip():
+            archived_text_path = self._archive_text_input(
+                raw_text=content,
+                preferred_name=self._derive_text_source_name(source_ref_override, base_source_metadata),
+            )
+            base_source_metadata["archived_source_path"] = str(archived_text_path)
+            base_source_metadata["archived_source_name"] = archived_text_path.name
+            base_source_metadata.setdefault("source_kind", "text")
         analysis = self.analyze_submission(content, visit_links=visit_links)
         search_references = self._collect_search_references(
             content=content,
@@ -296,6 +1313,8 @@ class ApiServiceContainer:
                 if self._is_collection_only_section(section):
                     continue
                 variants = self._expand_section_variants(section)
+                should_skip_relationship_reorg = len(variants) >= 2
+                section_states: list[AgentState] = []
                 for variant in variants:
                     fetched_texts: list[str] = []
                     fetched_metadata: dict = {}
@@ -343,73 +1362,101 @@ class ApiServiceContainer:
                         except Exception:
                             continue
 
-                    source_ref = variant["urls"][0] if variant["urls"] else None
-                    source_type = SourceType.LINK if source_ref else SourceType.TEXT
-                    states.append(
-                        self.ingest(
-                            raw_input=self._compose_contextual_payload(
-                                source_title=str(variant["source_title"]),
-                                shared_context=self._select_shared_context_for_candidate(
-                                    shared_context=shared_context,
-                                    semantic_tags=variant["semantic_tags"],
-                                    keyword_hints=keyword_hints,
-                                ),
-                                section_text=variant["section_text"],
-                                relationship_tags=variant["semantic_tags"],
+                    source_ref = source_ref_override or (
+                        variant["urls"][0] if variant["urls"] else None
+                    )
+                    source_type = source_type_override or (
+                        SourceType.LINK if source_ref else SourceType.TEXT
+                    )
+                    child_state = self.ingest(
+                        raw_input=self._compose_contextual_payload(
+                            source_title=str(variant["source_title"]),
+                            shared_context=self._select_shared_context_for_candidate(
+                                shared_context=shared_context,
+                                semantic_tags=variant["semantic_tags"],
                                 keyword_hints=keyword_hints,
-                                search_references=search_references,
+                            ),
+                            section_text=variant["section_text"],
+                            relationship_tags=variant["semantic_tags"],
+                            keyword_hints=keyword_hints,
+                            search_references=search_references,
+                            fetched_texts=fetched_texts,
+                        ),
+                        source_type=source_type,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                        source_ref=source_ref,
+                        memory_write_mode=memory_write_mode,
+                        source_metadata={
+                            **base_source_metadata,
+                            **fetched_metadata,
+                            "source_title": variant["source_title"],
+                            "source_kind": source_type.value,
+                            "detected_input_kind": analysis.input_kind,
+                            "input_urls": analysis.urls,
+                            "analysis_reasons": analysis.reasons,
+                            "keyword_hints": keyword_hints,
+                            "search_references": search_references,
+                            "shared_context": shared_context,
+                            "shared_exam_dates": [
+                                value.isoformat() for value in shared_exam_dates
+                            ],
+                            "next_shared_exam_date": (
+                                next_shared_exam_date.isoformat()
+                                if next_shared_exam_date
+                                else None
+                            ),
+                            "global_deadline": (
+                                next_shared_exam_date.isoformat()
+                                if next_shared_exam_date
+                                else None
+                            ),
+                            "skip_relationship_reorg": should_skip_relationship_reorg,
+                            "section_title": section.section_title,
+                            "original_section_text": variant["section_text"],
+                            "role_variant": variant["role_variant"],
+                            "semantic_tags": variant["semantic_tags"],
+                            "relationship_tags": variant["semantic_tags"],
+                            "relationship_family": variant["relationship_family"],
+                            "relationship_stage": variant["relationship_stage"],
+                            "primary_unit": variant["primary_unit"],
+                            "identity_tag": variant["identity_tag"],
+                            "fetch_plan": fetch_plans,
+                            "location_pending": self._is_location_pending(
+                                section_text=variant["section_text"],
                                 fetched_texts=fetched_texts,
                             ),
-                            source_type=source_type,
-                            user_id=user_id,
-                            workspace_id=workspace_id,
-                            source_ref=source_ref,
-                            memory_write_mode=memory_write_mode,
-                            source_metadata={
-                                **fetched_metadata,
-                                "source_title": variant["source_title"],
-                                "source_kind": source_type.value,
-                                "detected_input_kind": analysis.input_kind,
-                                "input_urls": analysis.urls,
-                                "analysis_reasons": analysis.reasons,
-                                "keyword_hints": keyword_hints,
-                                "search_references": search_references,
-                                "shared_context": shared_context,
-                                "shared_exam_dates": [
-                                    value.isoformat() for value in shared_exam_dates
-                                ],
-                                "next_shared_exam_date": (
-                                    next_shared_exam_date.isoformat()
-                                    if next_shared_exam_date
-                                    else None
-                                ),
-                                "global_deadline": (
-                                    next_shared_exam_date.isoformat()
-                                    if next_shared_exam_date
-                                    else None
-                                ),
-                                "section_title": section.section_title,
-                                "original_section_text": variant["section_text"],
-                                "role_variant": variant["role_variant"],
-                                "semantic_tags": variant["semantic_tags"],
-                                "relationship_tags": variant["semantic_tags"],
-                                "relationship_family": variant["relationship_family"],
-                                "relationship_stage": variant["relationship_stage"],
-                                "primary_unit": variant["primary_unit"],
-                                "identity_tag": variant["identity_tag"],
-                                "fetch_plan": fetch_plans,
-                                "location_pending": self._is_location_pending(
-                                    section_text=variant["section_text"],
-                                    fetched_texts=fetched_texts,
-                                ),
-                                "visited_urls": [
-                                    url
-                                    for url in variant["urls"]
-                                    if url in visited_urls
-                                ],
-                            },
-                        )
+                            "visited_urls": [
+                                url
+                                for url in variant["urls"]
+                                if url in visited_urls
+                            ],
+                        },
                     )
+                    section_states.append(child_state)
+                    states.append(child_state)
+
+                if len(section_states) >= 2:
+                    overview_state = self._build_job_group_overview_state(
+                        section=section,
+                        child_states=section_states,
+                        shared_context=shared_context,
+                        shared_exam_dates=shared_exam_dates,
+                        next_shared_exam_date=next_shared_exam_date,
+                        keyword_hints=keyword_hints,
+                        search_references=search_references,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                        memory_write_mode=memory_write_mode,
+                        base_source_metadata=base_source_metadata,
+                        source_type_override=source_type_override,
+                        source_ref_override=source_ref_override,
+                    )
+                    overview_state = self._expand_job_group_overview_with_existing_cards(
+                        overview_state=overview_state,
+                        child_states=section_states,
+                    )
+                    states.append(overview_state)
 
             analysis = SubmissionAnalysis(
                 input_kind=analysis.input_kind,
@@ -426,7 +1473,10 @@ class ApiServiceContainer:
 
         if not states:
             fetched_texts: list[str] = []
-            fallback_title = "统一输入卡片"
+            fallback_title = self._infer_submission_title_from_content(
+                analysis.context_text or content,
+                keyword_hints=keyword_hints,
+            )
             source_metadata = {
                 "detected_input_kind": analysis.input_kind,
                 "input_urls": analysis.urls,
@@ -493,7 +1543,9 @@ class ApiServiceContainer:
                 )
                 for url in analysis.urls
             ]
-            fallback_source_type = SourceType.LINK if analysis.input_kind == "link" else SourceType.TEXT
+            fallback_source_type = source_type_override or (
+                SourceType.LINK if analysis.input_kind == "link" else SourceType.TEXT
+            )
             states.append(
                 self.ingest(
                     raw_input=self._compose_contextual_payload(
@@ -512,9 +1564,12 @@ class ApiServiceContainer:
                     source_type=fallback_source_type,
                     user_id=user_id,
                     workspace_id=workspace_id,
-                    source_ref=analysis.urls[0] if analysis.urls else None,
+                    source_ref=source_ref_override or (
+                        analysis.urls[0] if analysis.urls else None
+                    ),
                     memory_write_mode=memory_write_mode,
                     source_metadata={
+                        **base_source_metadata,
                         **source_metadata,
                         "search_references": search_references,
                         "fetch_plan": fetch_plans,
@@ -528,6 +1583,114 @@ class ApiServiceContainer:
 
         return analysis, states
 
+    def ingest_unified(
+        self,
+        *,
+        content: str,
+        uploaded_files: list[tuple[str, bytes]],
+        user_id: str,
+        workspace_id: str | None,
+        memory_write_mode: MemoryWriteMode = MemoryWriteMode.CONTEXT_ONLY,
+        visit_links: bool | None = None,
+    ) -> tuple[SubmissionAnalysis, list[AgentState], list[dict[str, Any]], list[str]]:
+        """Ingest inline text, uploaded files, and local file paths in one request."""
+
+        inline_content, local_paths = self._split_inline_content_and_paths(content)
+        analyses: list[SubmissionAnalysis] = []
+        states: list[AgentState] = []
+        attachment_summaries: list[dict[str, Any]] = []
+        resolved_paths = [str(path) for path in local_paths]
+
+        if inline_content:
+            analysis, inline_states = self.ingest_auto(
+                content=inline_content,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                memory_write_mode=memory_write_mode,
+                visit_links=visit_links,
+            )
+            analyses.append(analysis)
+            states.extend(inline_states)
+
+        attachments: list[ExtractedAttachment] = []
+        for local_path in local_paths:
+            attachments.append(self._extract_attachment_from_local_path(local_path))
+        for file_name, file_bytes in uploaded_files:
+            attachments.append(
+                self._extract_attachment_from_upload(
+                    file_name=file_name,
+                    file_bytes=file_bytes,
+                )
+            )
+
+        for attachment in attachments:
+            attachment_summaries.append(
+                {
+                    "display_name": attachment.display_name,
+                    "source_ref": attachment.source_ref,
+                    "source_type": attachment.source_type.value,
+                    "extraction_kind": attachment.extraction_kind,
+                    "text_length": len(attachment.text),
+                }
+            )
+            attachment_analysis, attachment_states = self.ingest_auto(
+                content=attachment.text,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                memory_write_mode=memory_write_mode,
+                visit_links=visit_links,
+                source_type_override=attachment.source_type,
+                source_ref_override=attachment.source_ref,
+                base_source_metadata=attachment.source_metadata,
+            )
+            analyses.append(attachment_analysis)
+            states.extend(attachment_states)
+
+        if not analyses:
+            raise RuntimeError("请输入文本、上传文件，或提供本地图片/文件路径。")
+
+        merged_reasons: list[str] = []
+        merged_urls: list[str] = []
+        merged_keywords: list[str] = []
+        for analysis in analyses:
+            for reason in analysis.reasons:
+                if reason not in merged_reasons:
+                    merged_reasons.append(reason)
+            for url in analysis.urls:
+                if url not in merged_urls:
+                    merged_urls.append(url)
+            for keyword in analysis.keyword_hints:
+                if keyword not in merged_keywords:
+                    merged_keywords.append(keyword)
+
+        aggregate_kind = analyses[0].input_kind
+        if attachments and inline_content:
+            aggregate_kind = "mixed_text_and_files"
+        elif attachments and not inline_content:
+            aggregate_kind = "attachments_only"
+
+        merged_analysis = SubmissionAnalysis(
+            input_kind=aggregate_kind,
+            context_text=inline_content,
+            urls=merged_urls,
+            should_visit_links=any(analysis.should_visit_links for analysis in analyses),
+            reasons=[
+                *merged_reasons,
+                (
+                    f"processed {len(attachments)} attachments"
+                    if attachments
+                    else "no attachments"
+                ),
+                (
+                    f"resolved {len(local_paths)} local paths"
+                    if local_paths
+                    else "no local paths"
+                ),
+            ],
+            keyword_hints=merged_keywords,
+        )
+        return merged_analysis, states, attachment_summaries, resolved_paths
+
     def ingest_image_file(
         self,
         *,
@@ -539,29 +1702,510 @@ class ApiServiceContainer:
     ) -> AgentState:
         """Ingest one uploaded image by running OCR before the workflow."""
 
-        upload_dir = Path("data/runtime/uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file_name).strip("._") or "upload.png"
-        stored_path = upload_dir / f"{uuid4().hex[:10]}_{safe_name}"
-        stored_path.write_bytes(file_bytes)
+        attachment = self._extract_attachment_from_upload(
+            file_name=file_name,
+            file_bytes=file_bytes,
+        )
 
-        ocr_result = self.dependencies.ocr_client.extract_text(stored_path)
-        source_metadata = {
-            "source_kind": "image",
-            "file_name": file_name,
-            "stored_path": str(stored_path),
-            **ocr_result.source_metadata,
-        }
-
-        return self.ingest(
-            raw_input=ocr_result.text,
-            source_type=SourceType.IMAGE,
+        _, states = self.ingest_auto(
+            content=attachment.text,
             user_id=user_id,
             workspace_id=workspace_id,
-            source_ref=file_name,
             memory_write_mode=memory_write_mode,
-            source_metadata=source_metadata,
+            source_type_override=attachment.source_type,
+            source_ref_override=attachment.source_ref,
+            base_source_metadata=attachment.source_metadata,
         )
+        return self._select_primary_ingest_state(states)
+
+    def _extract_attachment_from_upload(
+        self,
+        *,
+        file_name: str,
+        file_bytes: bytes,
+    ) -> ExtractedAttachment:
+        """Store one uploaded file and convert it into analyzable text."""
+
+        stored_path = self._store_upload_bytes(
+            file_name=file_name,
+            file_bytes=file_bytes,
+        )
+        return self._extract_attachment_from_path(
+            file_path=stored_path,
+            display_name=file_name,
+            source_ref=file_name,
+            source_origin="uploaded_file",
+        )
+
+    def _extract_attachment_from_local_path(self, file_path: Path) -> ExtractedAttachment:
+        """Convert one user-provided local file path into analyzable text."""
+
+        archived_path = self._archive_existing_file(
+            file_path=file_path,
+            preferred_name=file_path.name,
+            category="local_path",
+        )
+        return self._extract_attachment_from_path(
+            file_path=archived_path,
+            display_name=file_path.name,
+            source_ref=str(archived_path),
+            source_origin="local_path",
+        )
+
+    def _extract_attachment_from_path(
+        self,
+        *,
+        file_path: Path,
+        display_name: str,
+        source_ref: str,
+        source_origin: str,
+    ) -> ExtractedAttachment:
+        """Extract text from one stored or local file."""
+
+        suffix = file_path.suffix.lower()
+        if suffix in IMAGE_FILE_SUFFIXES:
+            ocr_result = self.dependencies.ocr_client.extract_text(file_path)
+            return ExtractedAttachment(
+                display_name=display_name,
+                source_ref=source_ref,
+                source_type=SourceType.IMAGE,
+                text=ocr_result.text,
+                extraction_kind="ocr",
+                source_metadata={
+                    "source_kind": "image",
+                    "source_origin": source_origin,
+                    "file_name": display_name,
+                    "stored_path": str(file_path),
+                    "archived_source_path": str(file_path.resolve()),
+                    "archived_source_name": file_path.name,
+                    **ocr_result.source_metadata,
+                },
+            )
+
+        if suffix in DOCUMENT_FILE_SUFFIXES:
+            document_result = self._extract_document_text_with_fallback(
+                file_path=file_path,
+                display_name=display_name,
+            )
+            return ExtractedAttachment(
+                display_name=display_name,
+                source_ref=source_ref,
+                source_type=SourceType.TEXT,
+                text=document_result.text,
+                extraction_kind=str(
+                    document_result.source_metadata.get("document_extractor")
+                    or "document_text"
+                ),
+                source_metadata={
+                    "source_kind": "document",
+                    "source_origin": source_origin,
+                    "file_name": display_name,
+                    "stored_path": str(file_path),
+                    "archived_source_path": str(file_path.resolve()),
+                    "archived_source_name": file_path.name,
+                    "original_file_suffix": suffix,
+                    **document_result.source_metadata,
+                },
+            )
+
+        raise RuntimeError(
+            f"暂不支持上传 {display_name} 这类文件。当前支持图片、PDF 和常见文本文件。"
+        )
+
+    def _extract_document_text_with_fallback(
+        self,
+        *,
+        file_path: Path,
+        display_name: str,
+    ) -> DocumentTextExtractionResult:
+        """Extract document text and fallback to OCR for PDFs that lack embedded text."""
+
+        try:
+            return self.dependencies.document_text_extractor.extract_text(file_path)
+        except RuntimeError as exc:
+            if file_path.suffix.lower() != ".pdf":
+                raise
+            return self._extract_pdf_text_via_ocr_fallback(
+                file_path=file_path,
+                display_name=display_name,
+                original_error=str(exc),
+            )
+
+    def _extract_pdf_text_via_ocr_fallback(
+        self,
+        *,
+        file_path: Path,
+        display_name: str,
+        original_error: str,
+    ) -> DocumentTextExtractionResult:
+        """Fallback to multi-page preview OCR when one PDF has no embedded text layer."""
+
+        try:
+            preview_images = self._render_pdf_preview_images(file_path)
+        except RuntimeError as render_error:
+            raise RuntimeError(
+                f"PDF {display_name} 读取失败。先尝试文本提取未成功：{original_error}；"
+                f"再尝试渲染预览图做 OCR 也失败：{render_error}"
+            ) from render_error
+
+        page_texts: list[str] = []
+        page_routes: list[str] = []
+        for index, preview_image in enumerate(preview_images, start=1):
+            try:
+                ocr_result = self.dependencies.ocr_client.extract_text(preview_image)
+            except RuntimeError as ocr_error:
+                raise RuntimeError(
+                    f"PDF {display_name} 第 {index} 页暂时无法转成可分析文本。"
+                    f"文本提取失败：{original_error}；OCR fallback 失败：{ocr_error}"
+                ) from ocr_error
+            page_routes.append(str(ocr_result.source_metadata.get("ocr_route") or "ocr"))
+            page_texts.append(f"[第 {index} 页]\n{ocr_result.text}")
+
+        combined_text = "\n\n".join(text for text in page_texts if text.strip())
+        if not combined_text.strip():
+            raise RuntimeError(
+                f"PDF {display_name} 经过多页 OCR 后仍未得到可分析文本。"
+            )
+
+        return DocumentTextExtractionResult(
+            text=combined_text,
+            source_metadata={
+                "document_extractor": "pdf_preview_ocr_multi_page",
+                "document_text_length": len(combined_text),
+                "pdf_text_fallback_reason": original_error,
+                "pdf_preview_images": [str(path) for path in preview_images],
+                "pdf_preview_page_count": len(preview_images),
+                "pdf_preview_ocr_routes": page_routes,
+            },
+        )
+
+    def _render_pdf_preview_images(self, file_path: Path) -> list[Path]:
+        """Render every PDF page into one PNG image for downstream OCR."""
+
+        try:
+            return self._render_pdf_preview_images_with_appkit(file_path)
+        except RuntimeError as appkit_error:
+            try:
+                return self._render_pdf_preview_images_with_swift(file_path)
+            except RuntimeError as swift_error:
+                raise RuntimeError(
+                    "当前环境无法完成多页 PDF 渲染。"
+                    f"AppKit 路径失败：{appkit_error}；"
+                    f"Swift PDFKit 路径失败：{swift_error}"
+                ) from swift_error
+
+    def _render_pdf_preview_images_with_appkit(self, file_path: Path) -> list[Path]:
+        """Render one PDF through the in-process AppKit bridge when available."""
+
+        try:
+            import AppKit
+        except ImportError as exc:
+            raise RuntimeError("当前环境缺少 Python AppKit 桥接。") from exc
+
+        data = AppKit.NSData.dataWithContentsOfFile_(str(file_path))
+        if data is None:
+            raise RuntimeError("无法读取 PDF 数据。")
+
+        pdf_rep = AppKit.NSPDFImageRep.imageRepWithData_(data)
+        if pdf_rep is None:
+            raise RuntimeError("无法创建 PDF 预览表示。")
+
+        page_count = int(pdf_rep.pageCount() or 0)
+        if page_count <= 0:
+            raise RuntimeError("PDF 页数不可用。")
+
+        preview_dir = SOURCE_ARCHIVE_ROOT / "pdf_preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        rendered_paths: list[Path] = []
+
+        for page_index in range(page_count):
+            pdf_rep.setCurrentPage_(page_index)
+            page_bounds = pdf_rep.bounds()
+            page_size = page_bounds.size
+            image = AppKit.NSImage.alloc().initWithSize_(page_size)
+            image.lockFocus()
+            pdf_rep.drawInRect_(
+                AppKit.NSMakeRect(0, 0, page_size.width, page_size.height)
+            )
+            image.unlockFocus()
+
+            tiff_data = image.TIFFRepresentation()
+            bitmap = AppKit.NSBitmapImageRep.imageRepWithData_(tiff_data)
+            png_data = bitmap.representationUsingType_properties_(
+                AppKit.NSBitmapImageFileTypePNG,
+                None,
+            )
+            output_path = preview_dir / (
+                f"{uuid4().hex[:10]}_{file_path.stem}_page_{page_index + 1}.png"
+            )
+            success = png_data.writeToFile_atomically_(str(output_path), True)
+            if not success:
+                raise RuntimeError(f"第 {page_index + 1} 页预览图写入失败。")
+            rendered_paths.append(output_path)
+
+        return rendered_paths
+
+    def _render_pdf_preview_images_with_swift(self, file_path: Path) -> list[Path]:
+        """Fallback to a tiny Swift + PDFKit renderer when Python AppKit is unavailable."""
+
+        swift_binary = shutil.which("swift") or "/usr/bin/swift"
+        if not Path(swift_binary).exists():
+            raise RuntimeError("系统缺少 Swift 运行时。")
+
+        preview_dir = SOURCE_ARCHIVE_ROOT / "pdf_preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = preview_dir / uuid4().hex[:12]
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        swift_source = """
+import Foundation
+import AppKit
+import PDFKit
+
+let arguments = CommandLine.arguments
+guard arguments.count >= 3 else {
+    fputs("missing arguments\\n", stderr)
+    exit(2)
+}
+
+let pdfURL = URL(fileURLWithPath: arguments[1])
+let outputDirectory = URL(fileURLWithPath: arguments[2], isDirectory: true)
+
+guard let document = PDFDocument(url: pdfURL) else {
+    fputs("unable to open pdf\\n", stderr)
+    exit(3)
+}
+
+let pageCount = document.pageCount
+if pageCount <= 0 {
+    fputs("pdf has no pages\\n", stderr)
+    exit(4)
+}
+
+var renderedPaths: [String] = []
+
+for pageIndex in 0..<pageCount {
+    guard let page = document.page(at: pageIndex) else { continue }
+    let pageBounds = page.bounds(for: .mediaBox)
+    if pageBounds.width <= 0 || pageBounds.height <= 0 { continue }
+
+    let pageSize = pageBounds.size
+    let image = NSImage(size: pageSize)
+    image.lockFocus()
+    NSColor.white.setFill()
+    NSBezierPath(rect: NSRect(origin: .zero, size: pageSize)).fill()
+    guard let graphicsContext = NSGraphicsContext.current else {
+        image.unlockFocus()
+        continue
+    }
+    page.draw(with: .mediaBox, to: graphicsContext.cgContext)
+    image.unlockFocus()
+
+    guard
+        let tiffData = image.tiffRepresentation,
+        let bitmap = NSBitmapImageRep(data: tiffData),
+        let pngData = bitmap.representation(using: .png, properties: [:])
+    else {
+        continue
+    }
+
+    let outputURL = outputDirectory.appendingPathComponent(
+        "\\(pageIndex + 1)_\\(pdfURL.deletingPathExtension().lastPathComponent).png"
+    )
+    do {
+        try pngData.write(to: outputURL)
+        renderedPaths.append(outputURL.path)
+    } catch {
+        fputs("write failed: \\(error)\\n", stderr)
+        exit(5)
+    }
+}
+
+if renderedPaths.isEmpty {
+    fputs("no pages rendered\\n", stderr)
+    exit(6)
+}
+
+for path in renderedPaths {
+    print(path)
+}
+"""
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".swift",
+            delete=False,
+        ) as script_file:
+            script_file.write(swift_source)
+            script_path = Path(script_file.name)
+
+        try:
+            completed = subprocess.run(
+                [swift_binary, str(script_path), str(file_path), str(run_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=90,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Swift PDF 渲染超时。") from exc
+        finally:
+            script_path.unlink(missing_ok=True)
+
+        if completed.returncode != 0:
+            error_text = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(error_text or "Swift PDF 渲染失败。")
+
+        rendered_paths = [
+            Path(line.strip())
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        ]
+        rendered_paths = [path for path in rendered_paths if path.exists() and path.is_file()]
+        if not rendered_paths:
+            raise RuntimeError("Swift PDF 渲染没有产出任何预览图。")
+        return rendered_paths
+
+    def _store_upload_bytes(self, *, file_name: str, file_bytes: bytes) -> Path:
+        """Persist one uploaded file into the local runtime upload directory."""
+
+        upload_dir = SOURCE_ARCHIVE_ROOT / "uploaded"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        original_path = Path(file_name)
+        suffix = original_path.suffix.lower()
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", original_path.stem).strip("._") or "upload"
+        safe_name = f"{stem}{suffix}" if suffix else stem
+        stored_path = upload_dir / f"{uuid4().hex[:10]}_{safe_name}"
+        stored_path.write_bytes(file_bytes)
+        return stored_path
+
+    def _ensure_source_artifact(
+        self,
+        *,
+        raw_input: str,
+        source_type: SourceType,
+        source_ref: str | None,
+        source_metadata: dict[str, Any],
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Ensure manual text and local-file inputs have archived source artifacts."""
+
+        if source_metadata.get("archived_source_path"):
+            archived_path = str(source_metadata.get("archived_source_path") or "").strip()
+            if archived_path:
+                return source_ref or archived_path, source_metadata
+
+        if source_type in {SourceType.TEXT, SourceType.IMAGE} and source_metadata.get("source_origin") in {
+            "uploaded_file",
+            "local_path",
+        }:
+            archived_path = str(source_metadata.get("stored_path") or "").strip()
+            if archived_path:
+                source_metadata["archived_source_path"] = archived_path
+                source_metadata["archived_source_name"] = Path(archived_path).name
+                return archived_path, source_metadata
+
+        if source_type == SourceType.TEXT:
+            archived_path = self._archive_text_input(
+                raw_text=raw_input,
+                preferred_name=self._derive_text_source_name(source_ref, source_metadata),
+            )
+            if source_ref:
+                source_metadata.setdefault("original_source_ref", source_ref)
+            source_metadata["archived_source_path"] = str(archived_path)
+            source_metadata["archived_source_name"] = archived_path.name
+            source_metadata.setdefault("source_kind", "text")
+            return str(archived_path), source_metadata
+
+        return source_ref, source_metadata
+
+    def _derive_text_source_name(
+        self,
+        source_ref: str | None,
+        source_metadata: dict[str, Any],
+    ) -> str:
+        """Build one readable archived file name for text-origin inputs."""
+
+        title = str(
+            source_metadata.get("source_title")
+            or source_metadata.get("file_name")
+            or source_ref
+            or "text_input"
+        ).strip()
+        safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._") or "text_input"
+        if not safe_title.lower().endswith(".txt"):
+            safe_title = f"{safe_title}.txt"
+        return safe_title
+
+    def _archive_text_input(self, *, raw_text: str, preferred_name: str) -> Path:
+        """Persist one raw text input into the fixed local source archive."""
+
+        text_dir = SOURCE_ARCHIVE_ROOT / "text"
+        text_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", preferred_name).strip("._") or "text_input.txt"
+        if not safe_name.lower().endswith(".txt"):
+            safe_name = f"{safe_name}.txt"
+        archived_path = text_dir / f"{uuid4().hex[:10]}_{safe_name}"
+        archived_path.write_text(raw_text, encoding="utf-8")
+        return archived_path
+
+    def _archive_existing_file(
+        self,
+        *,
+        file_path: Path,
+        preferred_name: str,
+        category: str,
+    ) -> Path:
+        """Copy one existing local file into the fixed source archive directory."""
+
+        archive_dir = SOURCE_ARCHIVE_ROOT / category
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        preferred_path = Path(preferred_name)
+        suffix = preferred_path.suffix or file_path.suffix
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", preferred_path.stem).strip("._") or "attachment"
+        safe_name = f"{stem}{suffix}" if suffix else stem
+        archived_path = archive_dir / f"{uuid4().hex[:10]}_{safe_name}"
+        shutil.copy2(file_path, archived_path)
+        return archived_path
+
+    def _split_inline_content_and_paths(self, content: str) -> tuple[str, list[Path]]:
+        """Split pasted content into inline text and standalone local file paths."""
+
+        inline_lines: list[str] = []
+        resolved_paths: list[Path] = []
+        seen_paths: set[str] = set()
+
+        for raw_line in content.splitlines():
+            candidate = self._resolve_local_path_candidate(raw_line)
+            if candidate is not None:
+                normalized = str(candidate)
+                if normalized not in seen_paths:
+                    seen_paths.add(normalized)
+                    resolved_paths.append(candidate)
+                continue
+            inline_lines.append(raw_line)
+
+        inline_content = "\n".join(inline_lines).strip()
+        return inline_content, resolved_paths
+
+    def _resolve_local_path_candidate(self, raw_line: str) -> Path | None:
+        """Resolve one standalone local file path from the pasted input."""
+
+        candidate = raw_line.strip().strip('"').strip("'")
+        if not candidate:
+            return None
+        if not (
+            candidate.startswith("/")
+            or candidate.startswith("~/")
+            or candidate.startswith("./")
+            or candidate.startswith("../")
+        ):
+            return None
+
+        file_path = Path(candidate).expanduser()
+        if not file_path.is_file():
+            return None
+        return file_path.resolve()
 
     def list_items(
         self,
@@ -587,6 +2231,269 @@ class ApiServiceContainer:
         if state is not None and state.render_card is None and state.normalized_item is not None:
             state.render_card = self._build_fallback_card(state)
         return state
+
+    def get_source_file(self, item_id: str) -> tuple[Path, str] | None:
+        """Return one archived source file path and file name for the given item."""
+
+        state = self.get_item(item_id)
+        if state is None:
+            return None
+        archived_path = str(state.source_metadata.get("archived_source_path") or "").strip()
+        if not archived_path:
+            return None
+        path = Path(archived_path)
+        if not path.exists() or not path.is_file():
+            return None
+        file_name = str(state.source_metadata.get("archived_source_name") or "").strip() or path.name
+        return path, file_name
+
+    def cleanup_source_files(self, *, trigger: str = "manual") -> dict[str, Any]:
+        """Delete archived source files based on retention settings and references."""
+
+        states = self.dependencies.workflow_repository.list_all()
+        referenced_by_path: dict[str, list[AgentState]] = {}
+        for state in states:
+            archived_path = str(state.source_metadata.get("archived_source_path") or "").strip()
+            if not archived_path:
+                continue
+            referenced_by_path.setdefault(str(Path(archived_path).resolve()), []).append(state)
+
+        existing_files = [
+            file_path
+            for file_path in SOURCE_ARCHIVE_ROOT.rglob("*")
+            if file_path.is_file()
+        ]
+        total_size_before = sum(file_path.stat().st_size for file_path in existing_files)
+        max_age_cutoff = now_in_project_timezone() - timedelta(
+            days=self.settings.source_files.max_age_days
+        )
+        size_limit_bytes = self.settings.source_files.max_total_size_mb * 1024 * 1024
+        filter_patterns = [
+            pattern.lower().strip()
+            for pattern in self.settings.source_files.filter_patterns
+            if pattern.strip()
+        ]
+
+        reports = {
+            "scanned_file_count": len(existing_files),
+            "deleted_file_count": 0,
+            "reclaimed_bytes": 0,
+            "remaining_bytes": total_size_before,
+            "deleted_orphan_file_count": 0,
+            "deleted_due_to_age_count": 0,
+            "deleted_due_to_size_count": 0,
+            "deleted_due_to_filter_count": 0,
+            "deleted_paths": [],
+            "trigger": trigger,
+        }
+
+        deletion_candidates: list[tuple[Path, str]] = []
+        for file_path in existing_files:
+            resolved = str(file_path.resolve())
+            linked_states = referenced_by_path.get(resolved, [])
+            reason: str | None = None
+            if not linked_states:
+                reason = "orphan"
+            elif any(self._matches_source_file_filter(file_path, state, filter_patterns) for state in linked_states):
+                reason = "filter"
+            else:
+                modified_at = datetime.fromtimestamp(
+                    file_path.stat().st_mtime,
+                    tz=now_in_project_timezone().tzinfo,
+                )
+                if modified_at < max_age_cutoff:
+                    reason = "age"
+
+            if reason is None:
+                continue
+            deletion_candidates.append((file_path, reason))
+
+        for file_path, reason in deletion_candidates:
+            self._delete_source_file_and_detach_refs(
+                file_path=file_path,
+                referenced_states=referenced_by_path.get(str(file_path.resolve()), []),
+                report=reports,
+                reason=reason,
+            )
+
+        remaining_files = [
+            file_path
+            for file_path in SOURCE_ARCHIVE_ROOT.rglob("*")
+            if file_path.is_file()
+        ]
+        total_size = sum(file_path.stat().st_size for file_path in remaining_files)
+        if total_size > size_limit_bytes:
+            for file_path in sorted(
+                remaining_files,
+                key=lambda candidate: candidate.stat().st_mtime,
+            ):
+                if total_size <= size_limit_bytes:
+                    break
+                total_size -= self._delete_source_file_and_detach_refs(
+                    file_path=file_path,
+                    referenced_states=referenced_by_path.get(str(file_path.resolve()), []),
+                    report=reports,
+                    reason="size",
+                )
+
+        reports["remaining_bytes"] = sum(
+            file_path.stat().st_size
+            for file_path in SOURCE_ARCHIVE_ROOT.rglob("*")
+            if file_path.is_file()
+        )
+        return reports
+
+    def _matches_source_file_filter(
+        self,
+        file_path: Path,
+        state: AgentState,
+        filter_patterns: list[str],
+    ) -> bool:
+        """Return whether one file or its card metadata matches cleanup filters."""
+
+        if not filter_patterns:
+            return False
+        haystacks = [
+            str(file_path),
+            str(state.source_ref or ""),
+            str(state.raw_input or ""),
+            str(state.source_metadata.get("source_title") or ""),
+            str(state.render_card.summary_one_line if state.render_card else ""),
+        ]
+        joined = "\n".join(haystacks).lower()
+        return any(pattern in joined for pattern in filter_patterns)
+
+    def _delete_source_file_and_detach_refs(
+        self,
+        *,
+        file_path: Path,
+        referenced_states: list[AgentState],
+        report: dict[str, Any],
+        reason: str,
+    ) -> int:
+        """Delete one archived source file and detach related active card metadata."""
+
+        if not file_path.exists() or not file_path.is_file():
+            return 0
+        file_size = file_path.stat().st_size
+        resolved = str(file_path.resolve())
+        file_path.unlink(missing_ok=True)
+        report["deleted_file_count"] += 1
+        report["reclaimed_bytes"] += file_size
+        report["deleted_paths"].append(resolved)
+        if reason == "orphan":
+            report["deleted_orphan_file_count"] += 1
+        elif reason == "age":
+            report["deleted_due_to_age_count"] += 1
+        elif reason == "size":
+            report["deleted_due_to_size_count"] += 1
+        elif reason == "filter":
+            report["deleted_due_to_filter_count"] += 1
+
+        for state in referenced_states:
+            archived_path = str(state.source_metadata.get("archived_source_path") or "").strip()
+            if str(Path(archived_path).resolve()) != resolved:
+                continue
+            self._detach_archived_source_from_state(state)
+        return file_size
+
+    def _detach_archived_source_from_state(self, state: AgentState) -> None:
+        """Remove archived source file metadata from one stored state."""
+
+        state.source_metadata.pop("archived_source_path", None)
+        state.source_metadata.pop("archived_source_name", None)
+        if state.render_card is not None:
+            state.render_card.has_source_file = False
+            state.render_card.source_file_name = None
+            state.render_card.source_file_path = None
+        self.dependencies.workflow_repository.save(state)
+
+    def _collect_archived_paths_from_states(
+        self,
+        states: list[AgentState],
+    ) -> set[str]:
+        """Collect normalized archived source paths from a state list."""
+
+        archived_paths: set[str] = set()
+        for state in states:
+            archived_path = str(state.source_metadata.get("archived_source_path") or "").strip()
+            if not archived_path:
+                continue
+            archived_paths.add(str(Path(archived_path).resolve()))
+        return archived_paths
+
+    def _delete_unreferenced_archived_paths(self, archived_paths: set[str]) -> None:
+        """Delete archived files that are no longer referenced by any remaining card."""
+
+        if not archived_paths:
+            return
+
+        remaining_paths = self._collect_archived_paths_from_states(
+            self.dependencies.workflow_repository.list_all()
+        )
+        for archived_path in archived_paths:
+            if archived_path in remaining_paths:
+                continue
+            path = Path(archived_path)
+            if not path.exists() or not path.is_file():
+                continue
+            path.unlink(missing_ok=True)
+            self._prune_empty_source_dirs(path.parent)
+
+    def _prune_empty_source_dirs(self, directory: Path) -> None:
+        """Remove empty source-file subdirectories after one archived file is deleted."""
+
+        root = SOURCE_ARCHIVE_ROOT.resolve()
+        current = directory.resolve()
+        while current != root and root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
+    def _remove_deleted_item_links_from_remaining_cards(self, deleted_item_ids: set[str]) -> None:
+        """Detach deleted child ids from remaining overview cards."""
+
+        if not deleted_item_ids:
+            return
+
+        states = self.dependencies.workflow_repository.list_all()
+        for state in states:
+            if state.render_card is None:
+                continue
+            card = state.render_card
+            changed = False
+
+            next_market_children = [
+                child_id for child_id in card.market_child_item_ids if child_id not in deleted_item_ids
+            ]
+            if next_market_children != card.market_child_item_ids:
+                card.market_child_item_ids = next_market_children
+                card.market_child_previews = card.market_child_previews[: len(next_market_children)]
+                changed = True
+
+            next_job_children = [
+                child_id for child_id in card.job_child_item_ids if child_id not in deleted_item_ids
+            ]
+            if next_job_children != card.job_child_item_ids:
+                card.job_child_item_ids = next_job_children
+                card.job_child_previews = card.job_child_previews[: len(next_job_children)]
+                changed = True
+
+            if card.market_parent_item_id in deleted_item_ids:
+                card.market_parent_item_id = None
+                card.market_group_kind = None
+                changed = True
+
+            if card.job_parent_item_id in deleted_item_ids:
+                card.job_parent_item_id = None
+                card.job_group_kind = None
+                changed = True
+
+            if changed:
+                card.updated_at = now_in_project_timezone()
+                self.dependencies.workflow_repository.save(state)
 
     def update_item(
         self,
@@ -659,33 +2566,174 @@ class ApiServiceContainer:
         self.dependencies.workflow_repository.save(state)
         return state
 
+    def _expand_job_group_overview_with_existing_cards(
+        self,
+        *,
+        overview_state: AgentState,
+        child_states: list[AgentState],
+    ) -> AgentState:
+        """Merge one newly built overview with older related cards when the new section is only part of the cluster."""
+
+        if not child_states:
+            return overview_state
+
+        candidate_states: list[AgentState] = [*child_states]
+        candidate_states.extend(self._list_related_company_cards(overview_state))
+        for child_state in child_states:
+            candidate_states.extend(self._list_related_company_cards(child_state))
+        unique_candidates = self._dedupe_states_by_item_id(candidate_states)
+        if len(unique_candidates) <= len(child_states):
+            return overview_state
+
+        connected_ids: set[str] = set()
+        relationship_checks: list[dict[str, Any]] = []
+        group_title_votes: list[str] = []
+        for anchor_state in [*child_states, overview_state]:
+            cluster_states, cluster_checks, cluster_votes = self._collect_job_relationship_cluster(
+                anchor_state=anchor_state,
+                candidate_states=unique_candidates,
+            )
+            relationship_checks.extend(cluster_checks)
+            group_title_votes.extend(cluster_votes)
+            for cluster_state in cluster_states:
+                if cluster_state.normalized_item is not None:
+                    connected_ids.add(cluster_state.normalized_item.id)
+
+        if len(connected_ids) <= len(
+            [
+                child_state
+                for child_state in child_states
+                if child_state.normalized_item is not None
+            ]
+        ):
+            return overview_state
+
+        expanded_children = [
+            state
+            for state in unique_candidates
+            if state.normalized_item is not None and state.normalized_item.id in connected_ids
+        ]
+        group_title = self._pick_job_group_title(
+            expanded_children,
+            [
+                str(overview_state.normalized_item.source_title or "").strip()
+                if overview_state.normalized_item is not None
+                else "",
+                *group_title_votes,
+            ],
+        )
+        if not group_title:
+            return overview_state
+
+        expanded_overview = self._upsert_dynamic_job_group_overview(
+            anchor_state=child_states[0],
+            child_states=expanded_children,
+            group_title=group_title,
+        )
+        expanded_overview.source_metadata["job_relationship_checks"] = relationship_checks
+        self._refresh_stale_job_overviews(
+            user_id=child_states[0].user_id,
+            workspace_id=child_states[0].workspace_id,
+            keep_parent_id=expanded_overview.normalized_item.id if expanded_overview.normalized_item else None,
+        )
+        self.dependencies.workflow_repository.save(expanded_overview)
+        return expanded_overview
+
+    def _select_primary_ingest_state(self, states: list[AgentState]) -> AgentState:
+        """Choose the most representative state for single-item API responses."""
+
+        if not states:
+            raise RuntimeError("本次导入没有生成任何卡片。")
+        for state in reversed(states):
+            if state.source_metadata.get("job_group_kind") == "overview":
+                return state
+        for state in reversed(states):
+            parent_id = str(state.source_metadata.get("job_parent_item_id") or "").strip()
+            if not parent_id:
+                continue
+            parent_state = self.dependencies.workflow_repository.get(parent_id)
+            if parent_state is not None:
+                return parent_state
+        for state in reversed(states):
+            if state.render_card is not None:
+                return state
+        return states[-1]
+
     def delete_item(self, item_id: str) -> bool:
         """Delete one stored item plus its reminders."""
 
         state = self.get_item(item_id)
-        if state is not None and state.render_card is not None:
-            for child_item_id in state.render_card.market_child_item_ids:
-                if child_item_id != item_id:
-                    self.dependencies.reminder_queue.delete_for_item(child_item_id)
-                    self.dependencies.workflow_repository.delete(child_item_id)
-        self.dependencies.reminder_queue.delete_for_item(item_id)
-        return self.dependencies.workflow_repository.delete(item_id)
+        if state is None:
+            return False
+
+        states_to_delete: list[AgentState] = []
+        pending_item_ids = [item_id]
+        seen_target_ids: set[str] = set()
+        while pending_item_ids:
+            target_item_id = pending_item_ids.pop()
+            if target_item_id in seen_target_ids:
+                continue
+            target_state = self.get_item(target_item_id)
+            if target_state is None:
+                continue
+            states_to_delete.append(target_state)
+            if target_state.normalized_item is not None:
+                seen_target_ids.add(target_state.normalized_item.id)
+            else:
+                seen_target_ids.add(target_item_id)
+            if target_state.render_card is None:
+                continue
+            pending_item_ids.extend(
+                child_item_id
+                for child_item_id in [
+                    *target_state.render_card.market_child_item_ids,
+                    *target_state.render_card.job_child_item_ids,
+                ]
+                if child_item_id not in seen_target_ids
+            )
+
+        archived_paths = self._collect_archived_paths_from_states(states_to_delete)
+        deleted = False
+        deleted_item_ids: set[str] = set()
+        for target_state in states_to_delete:
+            target_item_id = (
+                target_state.normalized_item.id
+                if target_state.normalized_item is not None
+                else None
+            )
+            if not target_item_id:
+                continue
+            self.dependencies.reminder_queue.delete_for_item(target_item_id)
+            deleted_current = self.dependencies.workflow_repository.delete(target_item_id)
+            deleted = deleted_current or deleted
+            if deleted_current:
+                deleted_item_ids.add(target_item_id)
+        if deleted_item_ids:
+            self._remove_deleted_item_links_from_remaining_cards(deleted_item_ids)
+        if deleted and self.settings.source_files.delete_when_item_deleted:
+            self._delete_unreferenced_archived_paths(archived_paths)
+        return deleted
 
     def delete_items(self, item_ids: list[str]) -> tuple[list[str], list[str]]:
         """Delete multiple stored items and return deleted vs missing ids."""
 
         deleted_item_ids: list[str] = []
         missing_item_ids: list[str] = []
+        existing_item_ids: list[str] = []
         seen: set[str] = set()
 
         for item_id in item_ids:
             if item_id in seen:
                 continue
             seen.add(item_id)
+            if self.get_item(item_id) is None:
+                missing_item_ids.append(item_id)
+                continue
+            existing_item_ids.append(item_id)
+
+        for item_id in existing_item_ids:
             if self.delete_item(item_id):
                 deleted_item_ids.append(item_id)
-            else:
-                missing_item_ids.append(item_id)
 
         return deleted_item_ids, missing_item_ids
 
@@ -852,7 +2900,29 @@ class ApiServiceContainer:
             user_id=profile_memory.user_id,
             workspace_id=profile_memory.workspace_id,
         )
-        current["profile_memory"] = profile_memory
+        current_profile = ProfileMemory.model_validate(current["profile_memory"])
+        merged_profile = profile_memory.model_copy(
+            update={
+                "persona_keywords": (
+                    profile_memory.persona_keywords
+                    if profile_memory.persona_keywords
+                    else current_profile.persona_keywords
+                ),
+                "projects": (
+                    profile_memory.projects
+                    if profile_memory.projects
+                    else current_profile.projects
+                ),
+                "hard_filters": (
+                    profile_memory.hard_filters
+                    if profile_memory.hard_filters
+                    else current_profile.hard_filters
+                ),
+                "resume_snapshot": profile_memory.resume_snapshot or current_profile.resume_snapshot,
+                "last_confirmed_at": profile_memory.last_confirmed_at or current_profile.last_confirmed_at,
+            }
+        )
+        current["profile_memory"] = merged_profile
         self.dependencies.memory_provider.save(
             {
                 "user_id": profile_memory.user_id,
@@ -860,7 +2930,66 @@ class ApiServiceContainer:
                 **current,
             }
         )
-        return profile_memory, CareerStateMemory.model_validate(current["career_state_memory"])
+        return merged_profile, CareerStateMemory.model_validate(current["career_state_memory"])
+
+    def get_memory_snapshot(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> tuple[ProfileMemory, CareerStateMemory]:
+        """Return the current persisted memory snapshot for one user scope."""
+
+        current = self.dependencies.memory_provider.load(
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        return (
+            ProfileMemory.model_validate(current["profile_memory"]),
+            CareerStateMemory.model_validate(current["career_state_memory"]),
+        )
+
+    def get_resume_source_file(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> tuple[Path, str] | None:
+        """Return the archived resume source file saved in profile memory, when present."""
+
+        profile, _ = self.get_memory_snapshot(
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if profile.resume_snapshot is None or not profile.resume_snapshot.source_file_path:
+            return None
+
+        file_path = Path(profile.resume_snapshot.source_file_path)
+        if not file_path.exists() or not file_path.is_file():
+            return None
+        file_name = profile.resume_snapshot.source_file_name or file_path.name
+        return file_path, file_name
+
+    def get_project_source_file(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None,
+        project_name: str,
+    ) -> tuple[Path, str] | None:
+        """Return one archived project source file stored in profile memory."""
+
+        profile, _ = self.get_memory_snapshot(user_id=user_id, workspace_id=workspace_id)
+        for project in profile.projects:
+            if project.name.strip().lower() != project_name.strip().lower():
+                continue
+            if not project.source_file_path:
+                return None
+            file_path = Path(project.source_file_path)
+            if not file_path.exists():
+                return None
+            return file_path, project.source_file_name or file_path.name
+        return None
 
     def upsert_career_state_memory(
         self, career_state_memory: CareerStateMemory
@@ -1056,56 +3185,1220 @@ class ApiServiceContainer:
     ) -> tuple[str, list[str], list, str]:
         """Answer grounded follow-up questions from stored workflow and memory data."""
 
-        states = self.list_items(user_id=user_id, workspace_id=workspace_id)
-        if item_id:
-            target = self.get_item(item_id)
-            states = [target] if target else []
-        else:
-            cutoff = now_in_project_timezone()
-            states = [
-                state
-                for state in states
-                if state is not None
-                and self._state_timestamp(state) is not None
-                and (cutoff - self._state_timestamp(state)).days <= max(1, recent_days)
-            ]
+        result = self.chat_query_enhanced(
+            query=query,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            item_id=item_id,
+            recent_days=recent_days,
+            uploaded_files=[],
+            apply_memory_updates=True,
+        )
+        supporting_ids = result.supporting_item_ids
+        return (
+            result.answer,
+            supporting_ids,
+            result.citations,
+            result.retrieval_mode,
+        )
 
-        valid_states = [state for state in states if state is not None and state.normalized_item]
-        supporting_ids = [
-            state.normalized_item.id
-            for state in valid_states
-            if state.normalized_item is not None
-        ]
+    def chat_query_enhanced(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        workspace_id: str | None,
+        item_id: str | None = None,
+        recent_days: int = 30,
+        uploaded_files: list[tuple[str, bytes]] | None = None,
+        apply_memory_updates: bool = True,
+    ) -> ChatExecutionResult:
+        """Run chat preprocessing, optional attachment handling, retrieval, and memory updates."""
 
-        if not valid_states:
-            return (
-                "当前时间窗口内还没有可参考的卡片，先提交一条文本、链接、截图或放宽检索时间范围。",
-                [],
-                [],
-                "empty",
-            )
-
+        query_text, local_paths = self._split_inline_content_and_paths(query)
+        query_text = query_text.strip()
         current_memory = self.dependencies.memory_provider.load(
-            user_id=user_id, workspace_id=workspace_id
+            user_id=user_id,
+            workspace_id=workspace_id,
         )
         profile = ProfileMemory.model_validate(current_memory["profile_memory"])
-        career_state = CareerStateMemory.model_validate(
-            current_memory["career_state_memory"]
+        career_state = CareerStateMemory.model_validate(current_memory["career_state_memory"])
+
+        attachments, attachment_failures = self._collect_chat_attachments(
+            local_paths=local_paths,
+            uploaded_files=uploaded_files or [],
         )
+        if not query_text:
+            if any(self._looks_like_resume_attachment(attachment) for attachment in attachments):
+                query_text = "请基于我的简历给出求职建议、简历润色重点和面试准备方向。"
+            elif attachments:
+                query_text = "请基于我刚上传的资料给出下一步求职建议。"
+            elif attachment_failures:
+                query_text = "我上传的资料暂时解析失败了，请先说明可能原因，并告诉我下一步该怎么处理。"
+            else:
+                query_text = "请基于当前卡片和画像给我下一步建议。"
+
+        query_analysis = self.chat_service.analyze_query(
+            query=query_text,
+            recent_days=recent_days,
+        )
+        query_analysis = self._expand_chat_query_analysis(
+            query=query_text,
+            query_analysis=query_analysis,
+            profile=profile,
+            career_state=career_state,
+        )
+        selected_states = self._select_chat_states(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            item_id=item_id,
+            recent_days=query_analysis.recent_days,
+        )
+        valid_states = [
+            state for state in selected_states if state is not None and state.normalized_item
+        ]
+
+        (
+            profile,
+            career_state,
+            attachment_documents,
+            attachment_results,
+            memory_update,
+        ) = self._prepare_chat_context(
+            profile=profile,
+            career_state=career_state,
+            query=query_text,
+            query_analysis=query_analysis,
+            attachments=attachments,
+            apply_memory_updates=apply_memory_updates,
+        )
+
         result = self.chat_service.answer(
-            query=query,
+            query=query_text,
             states=valid_states,
             profile=profile,
             career_state=career_state,
             item_id=item_id,
-            recent_days=recent_days,
+            recent_days=query_analysis.recent_days,
+            extra_documents=attachment_documents,
+            query_analysis=query_analysis,
         )
+        all_attachment_results = [*attachment_failures, *attachment_results]
+        final_answer = self._compose_attachment_aware_answer(
+            answer=result.answer,
+            attachments=all_attachment_results,
+        )
+        supporting_ids = result.supporting_item_ids or [
+            state.normalized_item.id
+            for state in valid_states[:3]
+            if state.normalized_item is not None
+        ]
+
+        if memory_update.applied:
+            self.dependencies.memory_provider.save(
+                {
+                    "user_id": user_id,
+                    "workspace_id": workspace_id,
+                    "profile_memory": profile,
+                    "career_state_memory": career_state,
+                }
+            )
+
+        return ChatExecutionResult(
+            answer=final_answer,
+            supporting_item_ids=supporting_ids,
+            citations=result.citations,
+            retrieval_mode=result.retrieval_mode,
+            query_analysis=query_analysis,
+            memory_update=memory_update,
+            attachments=all_attachment_results,
+        )
+
+    def _expand_chat_query_analysis(
+        self,
+        *,
+        query: str,
+        query_analysis: QueryAnalysis,
+        profile: ProfileMemory,
+        career_state: CareerStateMemory,
+    ) -> QueryAnalysis:
+        """Build richer retrieval queries before RAG, using profile context and optional web expansion."""
+
+        heuristic_rewrite = self._build_chat_rewritten_query(
+            query=query,
+            query_analysis=query_analysis,
+            profile=profile,
+            career_state=career_state,
+        )
+        heuristic_queries = self._build_chat_retrieval_queries(
+            query=query,
+            query_analysis=query_analysis,
+            profile=profile,
+            career_state=career_state,
+            rewritten_query=heuristic_rewrite,
+        )
+        heuristic_web_queries = self._build_chat_web_search_queries(
+            query=query,
+            query_analysis=query_analysis,
+            profile=profile,
+            career_state=career_state,
+            rewritten_query=heuristic_rewrite,
+        )
+        search_hints = list(query_analysis.search_hints)
+        rewritten_query = heuristic_rewrite
+        retrieval_queries = heuristic_queries
+        web_search_queries = heuristic_web_queries
+
+        route = self.dependencies.model_router.select("chat", "medium")
+        if self.dependencies.llm_gateway.is_available(route):
+            try:
+                prompt = self.dependencies.prompt_loader.load("chat_query_rewrite")
+                response = self.dependencies.llm_gateway.complete_json(
+                    route=route,
+                    task_name="chat_query_rewrite",
+                    system_prompt=prompt,
+                    user_payload={
+                        "query": query,
+                        "intent": query_analysis.intent,
+                        "search_hints": search_hints,
+                        "profile_summary": {
+                            "target_roles": profile.target_roles,
+                            "priority_domains": profile.priority_domains,
+                            "skills": profile.skills,
+                            "persona_keywords": profile.persona_keywords,
+                        },
+                        "career_state_summary": {
+                            "today_focus": career_state.today_focus,
+                            "active_priorities": career_state.active_priorities,
+                            "watched_companies": career_state.watched_companies,
+                        },
+                        "fallback_rewritten_query": heuristic_rewrite,
+                        "fallback_retrieval_queries": heuristic_queries,
+                        "fallback_web_search_queries": heuristic_web_queries,
+                    },
+                )
+                rewritten_candidate = str(response.get("rewritten_query") or "").strip()
+                llm_queries = [
+                    str(value).strip()
+                    for value in response.get("retrieval_queries", [])
+                    if str(value).strip()
+                ]
+                llm_web_queries = [
+                    str(value).strip()
+                    for value in response.get("web_search_queries", [])
+                    if str(value).strip()
+                ]
+                llm_hints = [
+                    str(value).strip()
+                    for value in response.get("search_hints", [])
+                    if str(value).strip()
+                ]
+                if rewritten_candidate:
+                    rewritten_query = rewritten_candidate
+                retrieval_queries = self._merge_unique_texts(
+                    [query, rewritten_query, *heuristic_queries, *llm_queries],
+                    limit=6,
+                )
+                web_search_queries = self._merge_unique_texts(
+                    [*heuristic_web_queries, *llm_web_queries],
+                    limit=3,
+                )
+                search_hints = self._merge_unique_texts(
+                    [*search_hints, *llm_hints],
+                    limit=16,
+                )
+            except (LLMGatewayError, FileNotFoundError, KeyError, TypeError, ValueError):
+                pass
+
+        if self._should_expand_chat_query_with_web(query, query_analysis=query_analysis):
+            search_hints, web_search_queries = self._expand_chat_search_hints_via_web(
+                search_hints=search_hints,
+                web_search_queries=web_search_queries,
+            )
+
+        retrieval_queries = self._merge_unique_texts(
+            [query, rewritten_query, *retrieval_queries],
+            limit=6,
+        )
+        return replace(
+            query_analysis,
+            search_hints=tuple(search_hints),
+            rewritten_query=rewritten_query,
+            retrieval_queries=tuple(retrieval_queries),
+            web_search_queries=tuple(web_search_queries),
+        )
+
+    def _build_chat_rewritten_query(
+        self,
+        *,
+        query: str,
+        query_analysis: QueryAnalysis,
+        profile: ProfileMemory,
+        career_state: CareerStateMemory,
+    ) -> str:
+        """Normalize sparse chat questions into one more retrieval-friendly expression."""
+
+        focus_terms = self._collect_profile_focus_terms(profile, career_state)[:4]
+        base_query = re.sub(r"\s+", " ", query).strip()
+        if not base_query:
+            return "结合求职卡片和画像给出下一步建议"
+        if query_analysis.intent == "job_targeting" and any(
+            keyword in base_query for keyword in ("链接", "名称", "待投递", "岗位")
+        ):
+            joined_focus = " ".join(focus_terms)
+            return (
+                f"结合现有求职卡片，整理待跟进岗位的名称、公司、投递链接、来源链接 {joined_focus}"
+            ).strip()
+        if query_analysis.intent == "deadline_planning":
+            return f"结合现有卡片整理近期投递、面试、活动的 DDL 和时间节点 {base_query}".strip()
+        if query_analysis.intent in {"resume_polish", "interview_prep", "hr_reply"}:
+            joined_focus = " ".join(focus_terms)
+            return f"{base_query} 简历 项目经历 岗位 JD 面试 {joined_focus}".strip()
+        if self._is_sparse_chat_query(base_query):
+            joined_focus = " ".join(focus_terms)
+            return f"{base_query} 求职卡片 画像 {joined_focus}".strip()
+        return base_query
+
+    def _build_chat_retrieval_queries(
+        self,
+        *,
+        query: str,
+        query_analysis: QueryAnalysis,
+        profile: ProfileMemory,
+        career_state: CareerStateMemory,
+        rewritten_query: str,
+    ) -> list[str]:
+        """Create multiple retrieval formulations inspired by query rewrite and step-back retrieval."""
+
+        profile_terms = self._collect_profile_focus_terms(profile, career_state)[:4]
+        focus_suffix = " ".join(profile_terms).strip()
+        retrieval_queries = [query, rewritten_query]
+
+        if query_analysis.intent == "job_targeting":
+            retrieval_queries.append(
+                f"岗位 名称 链接 投递链接 来源链接 {' '.join(query_analysis.search_hints[:6])}".strip()
+            )
+            if focus_suffix:
+                retrieval_queries.append(f"岗位 投递 {focus_suffix}".strip())
+        elif query_analysis.intent == "deadline_planning":
+            retrieval_queries.append(
+                f"DDL 截止时间 投递 面试 提醒 {' '.join(query_analysis.search_hints[:6])}".strip()
+            )
+        elif query_analysis.intent in {"resume_polish", "interview_prep", "hr_reply"}:
+            retrieval_queries.append(
+                f"简历 项目经历 技术栈 岗位 JD {' '.join(query_analysis.search_hints[:6])}".strip()
+            )
+        elif self._is_sparse_chat_query(query):
+            retrieval_queries.append(
+                f"{' '.join(query_analysis.search_hints[:6])} {' '.join(profile_terms)}".strip()
+            )
+
+        if any(marker in query for marker in ("为什么", "如何", "怎么")):
+            retrieval_queries.append(
+                f"相关背景 原理 经验 {' '.join(query_analysis.search_hints[:6])}".strip()
+            )
+
+        return self._merge_unique_texts(retrieval_queries, limit=6)
+
+    def _build_chat_web_search_queries(
+        self,
+        *,
+        query: str,
+        query_analysis: QueryAnalysis,
+        profile: ProfileMemory,
+        career_state: CareerStateMemory,
+        rewritten_query: str,
+    ) -> list[str]:
+        """Prepare one or more tiny web-search queries only for keyword expansion."""
+
+        focus_terms = self._collect_profile_focus_terms(profile, career_state)[:3]
+        seed_terms = self._merge_unique_texts(
+            [*query_analysis.search_hints, *focus_terms],
+            limit=5,
+        )
+        web_queries = []
+        if seed_terms:
+            web_queries.append(" ".join(seed_terms))
+        if self._is_sparse_chat_query(query):
+            web_queries.append(f"{rewritten_query} {' '.join(seed_terms[:3])}".strip())
+        return self._merge_unique_texts(web_queries, limit=3)
+
+    def _should_expand_chat_query_with_web(
+        self,
+        query: str,
+        *,
+        query_analysis: QueryAnalysis,
+    ) -> bool:
+        """Use web snippets only as query-expansion fuel for underspecified questions."""
+
+        return bool(
+            self._is_sparse_chat_query(query)
+            or (
+                query_analysis.intent == "job_targeting"
+                and any(keyword in query for keyword in ("名称", "链接", "待投递", "所有"))
+            )
+        )
+
+    def _expand_chat_search_hints_via_web(
+        self,
+        *,
+        search_hints: list[str],
+        web_search_queries: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Search the web once to discover extra query terms, without answering from web results."""
+
+        if not web_search_queries:
+            return search_hints, web_search_queries
+        expanded_hints = list(search_hints)
+        successful_queries: list[str] = []
+        for query in web_search_queries[:2]:
+            try:
+                results = self.dependencies.search_client.search(query=query, limit=5)
+            except Exception:
+                continue
+            if not results:
+                continue
+            successful_queries.append(query)
+            for result in results:
+                expanded_hints.extend(
+                    self._extract_keyword_candidates(
+                        " ".join(
+                            [
+                                str(result.get("title") or ""),
+                                str(result.get("snippet") or ""),
+                            ]
+                        )
+                    )
+                )
         return (
-            result.answer,
-            result.supporting_item_ids or supporting_ids[:3],
-            result.citations,
-            result.retrieval_mode,
+            self._merge_unique_texts(expanded_hints, limit=16),
+            self._merge_unique_texts([*web_search_queries, *successful_queries], limit=3),
         )
+
+    def _merge_unique_texts(self, values: list[str], *, limit: int) -> list[str]:
+        """Deduplicate short strings while preserving order."""
+
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cleaned = re.sub(r"\s+", " ", str(value)).strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(cleaned)
+            if len(merged) >= limit:
+                break
+        return merged
+
+    def _is_sparse_chat_query(self, query: str) -> bool:
+        """Detect questions that are too short or generic to retrieve well without expansion."""
+
+        normalized = re.sub(r"\s+", " ", query).strip()
+        if len(normalized) <= 18:
+            return True
+        generic_markers = (
+            "请给我",
+            "帮我看看",
+            "有哪些",
+            "所有",
+            "这个",
+            "那个",
+            "名称与链接",
+            "待投递",
+        )
+        token_count = len(
+            re.findall(r"[A-Za-z0-9_+.#-]+|[\u4e00-\u9fff]{2,10}", normalized.lower())
+        )
+        return token_count <= 5 or any(marker in normalized for marker in generic_markers)
+
+    def _select_chat_states(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None,
+        item_id: str | None,
+        recent_days: int,
+    ) -> list[AgentState]:
+        """Select item states relevant to one chat turn before retrieval."""
+
+        states = self.list_items(user_id=user_id, workspace_id=workspace_id)
+        if item_id:
+            target = self.get_item(item_id)
+            return [target] if target else []
+
+        cutoff = now_in_project_timezone()
+        return [
+            state
+            for state in states
+            if state is not None
+            and self._state_timestamp(state) is not None
+            and (cutoff - self._state_timestamp(state)).days <= max(1, recent_days)
+        ]
+
+    def _collect_chat_attachments(
+        self,
+        *,
+        local_paths: list[Path],
+        uploaded_files: list[tuple[str, bytes]],
+    ) -> tuple[list[ExtractedAttachment], list[ChatAttachmentResult]]:
+        """Extract chat attachments without sending them through the item workflow."""
+
+        attachments: list[ExtractedAttachment] = []
+        failures: list[ChatAttachmentResult] = []
+        for local_path in local_paths:
+            try:
+                attachments.append(self._extract_attachment_from_local_path(local_path))
+            except Exception as exc:
+                failures.append(
+                    ChatAttachmentResult(
+                        display_name=local_path.name,
+                        source_ref=str(local_path),
+                        extraction_kind="failed",
+                        attachment_kind="document",
+                        summary="附件暂时未能成功转成可分析文本。",
+                        persisted_to_profile=False,
+                        text_length=0,
+                        processing_error=str(exc),
+                    )
+                )
+        for file_name, file_bytes in uploaded_files:
+            try:
+                attachments.append(
+                    self._extract_attachment_from_upload(
+                        file_name=file_name,
+                        file_bytes=file_bytes,
+                    )
+                )
+            except Exception as exc:
+                failures.append(
+                    ChatAttachmentResult(
+                        display_name=file_name,
+                        source_ref=file_name,
+                        extraction_kind="failed",
+                        attachment_kind="document",
+                        summary="附件暂时未能成功转成可分析文本。",
+                        persisted_to_profile=False,
+                        text_length=0,
+                        processing_error=str(exc),
+                    )
+                )
+        return attachments, failures
+
+    def _prepare_chat_context(
+        self,
+        *,
+        profile: ProfileMemory,
+        career_state: CareerStateMemory,
+        query: str,
+        query_analysis: QueryAnalysis,
+        attachments: list[ExtractedAttachment],
+        apply_memory_updates: bool,
+    ) -> tuple[
+        ProfileMemory,
+        CareerStateMemory,
+        list[RAGDocument],
+        list[ChatAttachmentResult],
+        ChatMemoryUpdateSummary,
+    ]:
+        """Prepare extra chat documents and conservative memory updates."""
+
+        extra_documents: list[RAGDocument] = []
+        attachment_results: list[ChatAttachmentResult] = []
+        notes: list[str] = []
+        profile_fields: list[str] = []
+        career_fields: list[str] = []
+        updated_profile = profile
+        updated_career = career_state
+
+        for attachment in attachments:
+            if self._looks_like_resume_attachment(attachment):
+                attachment_kind = "resume"
+            elif self._looks_like_project_attachment(attachment):
+                attachment_kind = "project"
+            else:
+                attachment_kind = "document"
+            attachment_summary = self._summarize_chat_attachment(
+                display_name=attachment.display_name,
+                attachment_kind=attachment_kind,
+                text=attachment.text,
+            )
+            extra_documents.append(
+                RAGDocument(
+                    doc_id=f"chat_attachment:{uuid4().hex}",
+                    doc_type=attachment_kind,
+                    source_label=(
+                        f"简历附件 - {attachment.display_name}"
+                        if attachment_kind == "resume"
+                        else (
+                            f"项目附件 - {attachment.display_name}"
+                            if attachment_kind == "project"
+                            else f"聊天附件 - {attachment.display_name}"
+                        )
+                    ),
+                    text=(
+                        f"文件名：{attachment.display_name}\n"
+                        f"主要内容：{attachment_summary}\n"
+                        f"文件正文：{attachment.text}"
+                    ),
+                    snippet=attachment_summary[:240],
+                    created_at=now_in_project_timezone(),
+                )
+            )
+            persisted = False
+            if apply_memory_updates and attachment_kind == "resume":
+                structured_resume = self._structure_resume_snapshot(
+                    display_name=attachment.display_name,
+                    text=attachment.text,
+                )
+                updated_profile = updated_profile.model_copy(
+                    update={
+                        "resume_snapshot": ResumeSnapshot(
+                            file_name=attachment.display_name,
+                            source_file_name=str(
+                                attachment.source_metadata.get("archived_source_name")
+                                or attachment.source_metadata.get("file_name")
+                                or attachment.display_name
+                            ),
+                            source_file_path=str(
+                                attachment.source_metadata.get("archived_source_path")
+                                or attachment.source_metadata.get("stored_path")
+                                or ""
+                            )
+                            or None,
+                            text=attachment.text,
+                            summary=self._build_resume_summary(attachment.text),
+                            structured_profile=structured_resume,
+                            updated_at=now_in_project_timezone(),
+                        ),
+                        "updated_at": now_in_project_timezone(),
+                    }
+                )
+                if "resume_snapshot" not in profile_fields:
+                    profile_fields.append("resume_snapshot")
+                notes.append(f"已把 {attachment.display_name} 作为最新简历原文写入画像。")
+                persisted = True
+            elif apply_memory_updates and attachment_kind == "project":
+                project_entry = self._structure_project_snapshot(
+                    display_name=attachment.display_name,
+                    text=attachment.text,
+                    source_file_name=str(
+                        attachment.source_metadata.get("archived_source_name")
+                        or attachment.source_metadata.get("file_name")
+                        or attachment.display_name
+                    )
+                    or None,
+                    source_file_path=str(
+                        attachment.source_metadata.get("archived_source_path")
+                        or attachment.source_metadata.get("stored_path")
+                        or ""
+                    )
+                    or None,
+                )
+                merged_projects, _ = self._merge_project_entries(
+                    current_projects=list(updated_profile.projects),
+                    new_entry=project_entry,
+                )
+                updated_profile = updated_profile.model_copy(
+                    update={
+                        "projects": merged_projects,
+                        "updated_at": now_in_project_timezone(),
+                    }
+                )
+                if "projects" not in profile_fields:
+                    profile_fields.append("projects")
+                notes.append(f"已把 {attachment.display_name} 整理成项目画像并写入长期记忆。")
+                persisted = True
+            attachment_results.append(
+                ChatAttachmentResult(
+                    display_name=attachment.display_name,
+                    source_ref=attachment.source_ref,
+                    extraction_kind=attachment.extraction_kind,
+                    attachment_kind=attachment_kind,
+                    summary=attachment_summary,
+                    persisted_to_profile=persisted,
+                    text_length=len(attachment.text),
+                    processing_error=None,
+                )
+            )
+
+        signal_texts = [query, *(attachment.text for attachment in attachments)]
+        if apply_memory_updates and query_analysis.should_update_memory:
+            updated_profile, new_profile_fields, profile_notes = self._merge_profile_from_chat_signals(
+                profile=updated_profile,
+                texts=signal_texts,
+                query_analysis=query_analysis,
+            )
+            updated_career, new_career_fields, career_notes = self._merge_career_from_chat_signals(
+                career_state=updated_career,
+                texts=signal_texts,
+                query_analysis=query_analysis,
+            )
+            profile_fields.extend(field for field in new_profile_fields if field not in profile_fields)
+            career_fields.extend(field for field in new_career_fields if field not in career_fields)
+            notes.extend(profile_notes)
+            notes.extend(career_notes)
+
+        applied = bool(profile_fields or career_fields)
+        return (
+            updated_profile,
+            updated_career,
+            extra_documents,
+            attachment_results,
+            ChatMemoryUpdateSummary(
+                applied=applied,
+                profile_fields=profile_fields,
+                career_fields=career_fields,
+                notes=notes,
+            ),
+        )
+
+    def _looks_like_resume_attachment(self, attachment: ExtractedAttachment) -> bool:
+        """Detect whether one attachment is likely a resume or self-profile document."""
+
+        if RESUME_FILE_NAME_PATTERN.search(attachment.display_name):
+            return True
+        marker_hits = sum(1 for marker in RESUME_SECTION_MARKERS if marker in attachment.text)
+        return marker_hits >= 2
+
+    def _looks_like_project_attachment(self, attachment: ExtractedAttachment) -> bool:
+        """Detect whether one attachment is likely a project profile or project description."""
+
+        if PROJECT_FILE_NAME_PATTERN.search(attachment.display_name):
+            return True
+        marker_hits = sum(1 for marker in PROJECT_SECTION_MARKERS if marker in attachment.text)
+        return marker_hits >= 2
+
+    def _build_resume_summary(self, text: str) -> str:
+        """Create one compact local summary from extracted resume text."""
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return "未提取到简历正文。"
+        return " / ".join(lines[:3])[:240]
+
+    def _build_project_summary(self, text: str) -> str:
+        """Create one compact local summary from a project description attachment."""
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return "未提取到项目说明正文。"
+        return " / ".join(lines[:4])[:260]
+
+    def _structure_project_snapshot(
+        self,
+        *,
+        display_name: str,
+        text: str,
+        source_file_name: str | None,
+        source_file_path: str | None,
+    ) -> ProjectMemoryEntry:
+        """Build one structured project profile from an uploaded project document."""
+
+        route = self.dependencies.model_router.select("chat", "medium")
+        if self.dependencies.llm_gateway.is_available(route):
+            try:
+                prompt = self.dependencies.prompt_loader.load("project_structure")
+                response = self.dependencies.llm_gateway.complete_json(
+                    route=route,
+                    task_name="project_structure",
+                    system_prompt=prompt,
+                    user_payload={
+                        "display_name": display_name,
+                        "text": text[:12000],
+                    },
+                )
+                name = str(response.get("name") or "").strip()
+                summary = str(response.get("summary") or "").strip()
+                if name and summary:
+                    return ProjectMemoryEntry(
+                        name=name,
+                        summary=summary[:280],
+                        role=str(response.get("role") or "").strip() or None,
+                        tech_stack=[
+                            str(value).strip()
+                            for value in response.get("tech_stack", [])
+                            if str(value).strip()
+                        ][:12],
+                        highlight_points=[
+                            str(value).strip()
+                            for value in response.get("highlight_points", [])
+                            if str(value).strip()
+                        ][:8],
+                        interview_story_hooks=[
+                            str(value).strip()
+                            for value in response.get("interview_story_hooks", [])
+                            if str(value).strip()
+                        ][:6],
+                        source_file_name=source_file_name,
+                        source_file_path=source_file_path,
+                    )
+            except (LLMGatewayError, FileNotFoundError, KeyError, TypeError, ValueError):
+                pass
+
+        return self._heuristic_structure_project(
+            display_name=display_name,
+            text=text,
+            source_file_name=source_file_name,
+            source_file_path=source_file_path,
+        )
+
+    def _heuristic_structure_project(
+        self,
+        *,
+        display_name: str,
+        text: str,
+        source_file_name: str | None,
+        source_file_path: str | None,
+    ) -> ProjectMemoryEntry:
+        """Fallback project structuring without a live LLM."""
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        name = Path(display_name).stem.strip() or "项目说明"
+        if lines:
+            first_line = lines[0].strip("：: ")
+            if 2 <= len(first_line) <= 48 and not URL_PATTERN.search(first_line):
+                name = first_line
+
+        summary = self._build_project_summary(text)
+        tech_stack = [
+            skill
+            for skill in KNOWN_SKILL_TERMS
+            if skill.lower() in text.lower()
+        ][:12]
+        highlight_points = [
+            line
+            for line in lines
+            if any(
+                marker in line
+                for marker in ("负责", "设计", "实现", "搭建", "优化", "提升", "落地", "效果", "指标", "%")
+            )
+        ][:6]
+        if not highlight_points:
+            highlight_points = lines[:4]
+        interview_story_hooks = highlight_points[:3] or lines[:3]
+        role = None
+        for line in lines[:10]:
+            if any(marker in line for marker in ("角色", "职责", "负责")):
+                role = line[:120]
+                break
+
+        return ProjectMemoryEntry(
+            name=name[:80],
+            summary=summary,
+            role=role,
+            tech_stack=tech_stack,
+            highlight_points=highlight_points,
+            interview_story_hooks=interview_story_hooks,
+            source_file_name=source_file_name,
+            source_file_path=source_file_path,
+        )
+
+    def _merge_project_entries(
+        self,
+        *,
+        current_projects: list[ProjectMemoryEntry],
+        new_entry: ProjectMemoryEntry,
+    ) -> tuple[list[ProjectMemoryEntry], bool]:
+        """Insert or replace one project entry by normalized project name."""
+
+        normalized_name = new_entry.name.strip().lower()
+        remaining_projects = [
+            project
+            for project in current_projects
+            if project.name.strip().lower() != normalized_name
+        ]
+        merged_projects = [*remaining_projects, new_entry]
+        return merged_projects, True
+
+    def _build_market_candidate_fallback_text(
+        self,
+        *,
+        candidate: MarketArticleCandidate,
+        published_at: datetime,
+    ) -> str:
+        """Build a minimal analyzable article body when only the title-level signal is available."""
+
+        lines = [
+            f"标题：{candidate.title}",
+            f"发布时间：{published_at.isoformat()}",
+            f"原始链接：{candidate.url}",
+        ]
+        if candidate.reason:
+            lines.append(f"入选原因：{candidate.reason}")
+        if candidate.snippet:
+            lines.append(f"标题摘要：{candidate.snippet}")
+        lines.append("说明：当前没有抓到正文，先保留标题级信号，方便在市场卡片中展开查看。")
+        return "\n".join(lines)
+
+    def _structure_resume_snapshot(
+        self,
+        *,
+        display_name: str,
+        text: str,
+    ) -> ResumeStructuredProfile:
+        """Build a structured resume view for the memory management page."""
+
+        route = self.dependencies.model_router.select("chat", "medium")
+        if self.dependencies.llm_gateway.is_available(route):
+            try:
+                prompt = self.dependencies.prompt_loader.load("resume_structure")
+                response = self.dependencies.llm_gateway.complete_json(
+                    route=route,
+                    task_name="resume_structure",
+                    system_prompt=prompt,
+                    user_payload={
+                        "display_name": display_name,
+                        "text": text[:12000],
+                    },
+                )
+                sections = [
+                    ResumeStructuredSection(
+                        title=str(section.get("title") or "").strip(),
+                        items=[
+                            str(item).strip()
+                            for item in section.get("items", [])
+                            if str(item).strip()
+                        ],
+                    )
+                    for section in response.get("sections", [])
+                    if str(section.get("title") or "").strip()
+                ]
+                if sections:
+                    return ResumeStructuredProfile(
+                        headline=str(response.get("headline") or "").strip() or None,
+                        sections=sections,
+                    )
+            except (LLMGatewayError, FileNotFoundError, KeyError, TypeError, ValueError):
+                pass
+
+        return self._heuristic_structure_resume(text=text)
+
+    def _heuristic_structure_resume(self, *, text: str) -> ResumeStructuredProfile:
+        """Fallback structured resume parsing without a live LLM."""
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return ResumeStructuredProfile(headline="未提取到简历正文。", sections=[])
+
+        section_aliases = {
+            "基本信息": "基本信息",
+            "教育经历": "教育经历",
+            "工作经历": "工作经历",
+            "实习经历": "实习经历",
+            "项目经历": "项目经历",
+            "校园经历": "校园经历",
+            "技能": "技能",
+            "专业技能": "技能",
+            "技能栈": "技能",
+            "自我评价": "自我评价",
+            "获奖经历": "获奖经历",
+            "证书": "证书",
+        }
+
+        sections: list[ResumeStructuredSection] = []
+        current_title = "基本信息"
+        current_items: list[str] = []
+        headline = " / ".join(lines[:2])[:160]
+
+        def flush_section() -> None:
+            nonlocal current_title, current_items
+            if not current_items:
+                return
+            sections.append(
+                ResumeStructuredSection(
+                    title=current_title,
+                    items=current_items[:12],
+                )
+            )
+            current_items = []
+
+        for line in lines:
+            normalized = line.strip("：: ").replace(" ", "")
+            matched_title = next(
+                (
+                    canonical
+                    for alias, canonical in section_aliases.items()
+                    if normalized.startswith(alias.replace(" ", ""))
+                    and len(normalized) <= len(alias.replace(" ", "")) + 2
+                ),
+                None,
+            )
+            if matched_title is not None:
+                flush_section()
+                current_title = matched_title
+                continue
+            current_items.append(line)
+
+        flush_section()
+        if not sections:
+            sections = [
+                ResumeStructuredSection(
+                    title="简历正文",
+                    items=lines[:20],
+                )
+            ]
+        return ResumeStructuredProfile(headline=headline, sections=sections[:8])
+
+    def _summarize_chat_attachment(
+        self,
+        *,
+        display_name: str,
+        attachment_kind: str,
+        text: str,
+    ) -> str:
+        """Summarize what one uploaded file mainly says before final answer generation."""
+
+        route = self.dependencies.model_router.select("chat", "medium")
+        if self.dependencies.llm_gateway.is_available(route):
+            try:
+                prompt = self.dependencies.prompt_loader.load("chat_attachment_summary")
+                response = self.dependencies.llm_gateway.complete_json(
+                    route=route,
+                    task_name="chat_attachment_summary",
+                    system_prompt=prompt,
+                    user_payload={
+                        "display_name": display_name,
+                        "attachment_kind": attachment_kind,
+                        "text": text[:8000],
+                    },
+                )
+                summary = str(response.get("summary") or "").strip()
+                if summary:
+                    return summary[:240]
+            except (LLMGatewayError, FileNotFoundError, KeyError, TypeError, ValueError):
+                pass
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return f"{display_name} 暂时没有提取到可用文本。"
+        if attachment_kind == "resume":
+            prefix = "这份简历主要包含"
+        elif attachment_kind == "project":
+            prefix = "这份项目说明主要包含"
+        else:
+            prefix = "这份文件主要包含"
+        return f"{prefix}：{' / '.join(lines[:3])}"[:240]
+
+    def _compose_attachment_aware_answer(
+        self,
+        *,
+        answer: str,
+        attachments: list[ChatAttachmentResult],
+    ) -> str:
+        """Ensure answers with uploaded files first explain what the files mainly say."""
+
+        if not attachments:
+            return answer
+
+        successful_attachments = [
+            attachment for attachment in attachments if not attachment.processing_error
+        ]
+        failed_attachments = [
+            attachment for attachment in attachments if attachment.processing_error
+        ]
+
+        summary_lines = [
+            f"- {attachment.display_name}：{attachment.summary}"
+            for attachment in successful_attachments
+        ]
+        failure_lines = [
+            f"- {attachment.display_name}：{attachment.processing_error}"
+            for attachment in failed_attachments
+        ]
+
+        blocks: list[str] = []
+        if summary_lines:
+            blocks.append(
+                "你上传的文件主要讲了这些内容：\n"
+                f"{chr(10).join(summary_lines)}"
+            )
+        if failure_lines:
+            blocks.append(
+                "以下附件这次没有成功解析：\n"
+                f"{chr(10).join(failure_lines)}"
+            )
+        blocks.append("结合这些文件内容，我的建议是：\n" f"{answer}")
+        return "\n\n".join(blocks)
+
+    def _merge_profile_from_chat_signals(
+        self,
+        *,
+        profile: ProfileMemory,
+        texts: list[str],
+        query_analysis: QueryAnalysis,
+    ) -> tuple[ProfileMemory, list[str], list[str]]:
+        """Merge low-risk profile fields from chat phrasing and attachments."""
+
+        changed_fields: list[str] = []
+        notes: list[str] = []
+        updates: dict[str, Any] = {}
+        combined_text = "\n".join(texts)
+
+        if any(hint in query_analysis.profile_update_hints for hint in ("target_roles", "projects")):
+            roles = self._extract_role_candidates(combined_text)
+            merged_roles, changed = self._merge_unique_strings(profile.target_roles, roles, limit=12)
+            if changed:
+                updates["target_roles"] = merged_roles
+                changed_fields.append("target_roles")
+                notes.append(f"补充目标岗位：{', '.join(roles[:4])}。")
+
+        if any(hint in query_analysis.profile_update_hints for hint in ("skills", "resume_snapshot", "projects")):
+            skills = self._extract_skill_candidates(combined_text)
+            merged_skills, changed = self._merge_unique_strings(profile.skills, skills, limit=20)
+            if changed:
+                updates["skills"] = merged_skills
+                changed_fields.append("skills")
+                notes.append(f"补充技能关键词：{', '.join(skills[:6])}。")
+
+        if "location_preferences" in query_analysis.profile_update_hints:
+            locations = self._extract_location_candidates(combined_text)
+            merged_locations, changed = self._merge_unique_strings(
+                profile.location_preferences,
+                locations,
+                limit=12,
+            )
+            if changed:
+                updates["location_preferences"] = merged_locations
+                changed_fields.append("location_preferences")
+                notes.append(f"补充地点偏好：{', '.join(locations[:4])}。")
+
+        if "persona_keywords" in query_analysis.profile_update_hints:
+            persona_keywords = self._extract_persona_keywords(combined_text, query_analysis)
+            merged_keywords, changed = self._merge_unique_strings(
+                profile.persona_keywords,
+                persona_keywords,
+                limit=16,
+            )
+            if changed:
+                updates["persona_keywords"] = merged_keywords
+                changed_fields.append("persona_keywords")
+                notes.append(f"记录用户自述关键词：{', '.join(persona_keywords[:5])}。")
+
+        if not updates:
+            return profile, [], []
+        updates["updated_at"] = now_in_project_timezone()
+        return profile.model_copy(update=updates), changed_fields, notes
+
+    def _merge_career_from_chat_signals(
+        self,
+        *,
+        career_state: CareerStateMemory,
+        texts: list[str],
+        query_analysis: QueryAnalysis,
+    ) -> tuple[CareerStateMemory, list[str], list[str]]:
+        """Merge low-risk dynamic career-state hints from chat turns."""
+
+        changed_fields: list[str] = []
+        notes: list[str] = []
+        updates: dict[str, Any] = {}
+        combined_text = "\n".join(texts)
+
+        if "watched_companies" in query_analysis.career_update_hints:
+            companies = self._extract_company_candidates(combined_text)
+            merged_companies, changed = self._merge_unique_strings(
+                career_state.watched_companies,
+                companies,
+                limit=16,
+            )
+            if changed:
+                updates["watched_companies"] = merged_companies
+                changed_fields.append("watched_companies")
+                notes.append(f"补充重点关注公司：{', '.join(companies[:4])}。")
+
+        if "active_priorities" in query_analysis.career_update_hints:
+            priority_label = CHAT_INTENT_PRIORITY_LABELS.get(query_analysis.intent)
+            priorities = [priority_label] if priority_label else []
+            merged_priorities, changed = self._merge_unique_strings(
+                career_state.active_priorities,
+                priorities,
+                limit=12,
+            )
+            if changed:
+                updates["active_priorities"] = merged_priorities
+                changed_fields.append("active_priorities")
+                notes.append(f"更新当前优先级：{priority_label}。")
+
+        if not updates:
+            return career_state, [], []
+        updates["updated_at"] = now_in_project_timezone()
+        return career_state.model_copy(update=updates), changed_fields, notes
+
+    def _merge_unique_strings(
+        self,
+        existing: list[str],
+        candidates: list[str],
+        *,
+        limit: int,
+    ) -> tuple[list[str], bool]:
+        """Append unique normalized strings while preserving original order."""
+
+        merged = list(existing)
+        seen = {value.strip().lower() for value in existing if value.strip()}
+        changed = False
+        for candidate in candidates:
+            cleaned = candidate.strip()
+            if not cleaned:
+                continue
+            normalized = cleaned.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(cleaned)
+            changed = True
+            if len(merged) >= limit:
+                break
+        return merged, changed
+
+    def _extract_role_candidates(self, text: str) -> list[str]:
+        """Extract role-like phrases from free-form chat and resume text."""
+
+        matches = re.findall(
+            r"([A-Za-z0-9+\-/#.\u4e00-\u9fff]{1,18}(?:工程师|开发|研发|产品经理|算法|分析师|设计师|运营|研究员|实习生))",
+            text,
+        )
+        return list(dict.fromkeys(match.strip() for match in matches if len(match.strip()) >= 2))[:8]
+
+    def _extract_skill_candidates(self, text: str) -> list[str]:
+        """Extract a compact skill list from known engineering terms."""
+
+        lowered = text.lower()
+        found: list[str] = []
+        for skill in KNOWN_SKILL_TERMS:
+            if skill.lower() in lowered:
+                found.append(skill)
+        return list(dict.fromkeys(found))[:10]
+
+    def _extract_location_candidates(self, text: str) -> list[str]:
+        """Extract location preferences from one chat turn."""
+
+        found = [location for location in KNOWN_LOCATION_TERMS if location in text]
+        return list(dict.fromkeys(found))[:6]
+
+    def _extract_company_candidates(self, text: str) -> list[str]:
+        """Extract company-like names from user questions and attachments."""
+
+        matches = [
+            match.group(1).strip()
+            for match in ORG_SUFFIX_PATTERN.finditer(text)
+        ]
+        short_names = re.findall(r"(阿里云|钉钉|夸克|高德|淘天|腾讯|字节跳动|美团|小红书|百度|华为)", text)
+        return list(dict.fromkeys([*matches, *short_names]))[:8]
+
+    def _extract_persona_keywords(
+        self,
+        text: str,
+        query_analysis: QueryAnalysis,
+    ) -> list[str]:
+        """Extract compact self-description keywords that can help future chat retrieval."""
+
+        keywords: list[str] = []
+        keywords.extend(query_analysis.search_hints)
+        keywords.extend(self._extract_role_candidates(text))
+        keywords.extend(self._extract_skill_candidates(text))
+        return list(dict.fromkeys(keyword for keyword in keywords if len(keyword) >= 2))[:8]
 
     def _market_refresh_due(
         self,
@@ -1570,10 +4863,15 @@ class ApiServiceContainer:
             fallback_message_time = self._coerce_datetime(candidate.published_at) or now
 
             if extracted_page is None:
-                if not candidate_text or source_site != article_url and not self._is_recent_market_article(
+                if source_site != article_url and not self._is_recent_market_article(
                     fallback_message_time, now
                 ):
                     continue
+                if not candidate_text:
+                    candidate_text = self._build_market_candidate_fallback_text(
+                        candidate=candidate,
+                        published_at=fallback_message_time,
+                    )
 
                 keyword_hints = self._extract_keyword_candidates(
                     f"{fallback_page_title} {candidate_text[:500]}"
@@ -2084,6 +5382,247 @@ class ApiServiceContainer:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=now_in_project_timezone().tzinfo)
         return parsed
+
+    def _build_job_group_overview_state(
+        self,
+        *,
+        section: SubmissionSection,
+        child_states: list[AgentState],
+        shared_context: str,
+        shared_exam_dates: list[datetime],
+        next_shared_exam_date: datetime | None,
+        keyword_hints: list[str],
+        search_references: list[str],
+        user_id: str,
+        workspace_id: str | None,
+        memory_write_mode: MemoryWriteMode,
+        base_source_metadata: dict[str, Any],
+        source_type_override: SourceType | None,
+        source_ref_override: str | None,
+    ) -> AgentState:
+        """Create one overview card for a multi-role recruiting section."""
+
+        child_titles = [
+            child.render_card.summary_one_line
+            for child in child_states
+            if child.render_card is not None and child.render_card.summary_one_line
+        ]
+        overview_title = section.identity_tag or section.primary_unit or section.section_title
+        source_ref = (
+            source_ref_override
+            or next(
+                (
+                    child.source_ref
+                    for child in child_states
+                    if child.source_ref
+                ),
+                section.urls[0] if section.urls else None,
+            )
+        )
+        source_type = source_type_override or (SourceType.LINK if source_ref else SourceType.TEXT)
+        state = self.ingest(
+            raw_input=self._compose_job_group_overview_payload(
+                section=section,
+                child_states=child_states,
+                shared_context=shared_context,
+                keyword_hints=keyword_hints,
+                search_references=search_references,
+            ),
+            source_type=source_type,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            source_ref=source_ref,
+            memory_write_mode=memory_write_mode,
+            source_metadata={
+                **base_source_metadata,
+                "source_title": overview_title,
+                "source_kind": source_type.value,
+                "job_group_kind": "overview",
+                "job_child_previews": child_titles[:6],
+                "child_role_count": len(child_states),
+                "keyword_hints": keyword_hints,
+                "search_references": search_references,
+                "shared_context": shared_context,
+                "shared_exam_dates": [value.isoformat() for value in shared_exam_dates],
+                "next_shared_exam_date": next_shared_exam_date.isoformat() if next_shared_exam_date else None,
+                "global_deadline": next_shared_exam_date.isoformat() if next_shared_exam_date else None,
+                "section_title": section.section_title,
+                "original_section_text": section.section_text,
+                "semantic_tags": list(dict.fromkeys([*section.semantic_tags, "岗位合集"])),
+                "relationship_tags": list(dict.fromkeys([*section.semantic_tags, "岗位合集"])),
+                "relationship_family": section.relationship_family,
+                "relationship_stage": section.relationship_stage,
+                "primary_unit": section.primary_unit,
+                "identity_tag": section.identity_tag,
+                "job_group_child_titles": child_titles[:8],
+                "job_group_child_categories": [
+                    child.classified_category.value
+                    for child in child_states
+                    if child.classified_category is not None
+                ],
+            },
+        )
+        self._postprocess_job_group_state(
+            state=state,
+            section=section,
+            child_states=child_states,
+            overview_title=overview_title,
+            child_previews=child_titles[:6],
+        )
+        parent_item_id = state.normalized_item.id if state.normalized_item is not None else None
+        if parent_item_id:
+            child_ids: list[str] = []
+            for child_state in child_states:
+                if child_state.normalized_item is None:
+                    continue
+                child_ids.append(child_state.normalized_item.id)
+                child_state.source_metadata["job_group_kind"] = "role"
+                child_state.source_metadata["job_parent_item_id"] = parent_item_id
+                child_state.source_metadata["job_child_item_ids"] = []
+                child_state.source_metadata["job_child_previews"] = []
+                if child_state.render_card is not None:
+                    child_state.render_card.job_group_kind = "role"
+                    child_state.render_card.job_parent_item_id = parent_item_id
+                    child_state.render_card.job_child_item_ids = []
+                    child_state.render_card.job_child_previews = []
+                self.dependencies.workflow_repository.save(child_state)
+            state.source_metadata["job_child_item_ids"] = child_ids
+            if state.render_card is not None:
+                state.render_card.job_child_item_ids = child_ids
+                state.render_card.job_child_previews = child_titles[:6]
+        self.dependencies.workflow_repository.save(state)
+        return state
+
+    def _compose_job_group_overview_payload(
+        self,
+        *,
+        section: SubmissionSection,
+        child_states: list[AgentState],
+        shared_context: str,
+        keyword_hints: list[str],
+        search_references: list[str],
+    ) -> str:
+        """Build one overview payload describing a multi-role recruiting section."""
+
+        lines = [
+            f"岗位合集主题：{section.identity_tag or section.primary_unit or section.section_title}",
+            f"岗位数量：{len(child_states)}",
+        ]
+        if shared_context:
+            lines.append(f"共享规则：{shared_context}")
+        if keyword_hints:
+            lines.append(f"关键词提示：{'、'.join(keyword_hints[:8])}")
+        if search_references:
+            lines.append("搜索参考：")
+            lines.extend(search_references[:2])
+        lines.append("岗位子项：")
+        for child_state in child_states[:8]:
+            child_summary = (
+                child_state.render_card.summary_one_line
+                if child_state.render_card is not None
+                else child_state.normalized_item.source_title if child_state.normalized_item else None
+            )
+            if child_summary:
+                lines.append(f"- {child_summary}")
+        lines.append("原始片段：")
+        lines.append(section.section_text[:2400])
+        return "\n".join(lines)
+
+    def _postprocess_job_group_state(
+        self,
+        *,
+        state: AgentState,
+        section: SubmissionSection,
+        child_states: list[AgentState],
+        overview_title: str,
+        child_previews: list[str],
+    ) -> None:
+        """Normalize one grouped activity overview card for the activity list UI."""
+
+        if state.normalized_item is None or state.render_card is None:
+            return
+
+        card = state.render_card
+        dominant_category = self._dominant_activity_category(child_states)
+        child_scores = [
+            child.render_card.ai_score
+            for child in child_states
+            if child.render_card is not None and child.render_card.ai_score is not None
+        ]
+        child_ddls = sorted(
+            [
+                child.extracted_signal.ddl
+                for child in child_states
+                if child.extracted_signal is not None and child.extracted_signal.ddl is not None
+            ]
+        )
+        child_companies = list(
+            dict.fromkeys(
+                child.extracted_signal.company
+                for child in child_states
+                if child.extracted_signal is not None and child.extracted_signal.company
+            )
+        )
+        child_cities = list(
+            dict.fromkeys(
+                child.extracted_signal.city
+                for child in child_states
+                if child.extracted_signal is not None and child.extracted_signal.city
+            )
+        )
+        overview_summary = f"{overview_title}（{len(child_states)}个岗位）"
+        overview_advice = "建议先展开岗位列表，再按 DDL、匹配度和地点筛选优先投递顺序。"
+        overview_tags = list(
+            dict.fromkeys(
+                [
+                    "岗位合集",
+                    *section.semantic_tags,
+                    *child_companies[:2],
+                    *child_cities[:2],
+                ]
+            )
+        )[:8]
+
+        card.content_category = dominant_category
+        card.job_group_kind = "overview"
+        card.job_parent_item_id = None
+        card.job_child_item_ids = list(state.source_metadata.get("job_child_item_ids", []))
+        card.job_child_previews = list(child_previews)
+        card.summary_one_line = overview_summary
+        card.company = child_companies[0] if len(child_companies) == 1 else section.primary_unit
+        card.role = None
+        card.city = child_cities[0] if len(child_cities) == 1 else None
+        card.location_note = None if len(child_cities) <= 1 else "该合集包含多个岗位地点，请展开子卡查看。"
+        card.ddl = child_ddls[0] if child_ddls else None
+        card.ai_score = round(sum(child_scores) / len(child_scores), 4) if child_scores else card.ai_score
+        card.insight_summary = f"识别到同一业务线下 {len(child_states)} 个岗位方向。"
+        card.advice = overview_advice
+        card.tags = overview_tags
+
+        if state.extracted_signal is not None:
+            state.extracted_signal.category = dominant_category
+            state.extracted_signal.company = card.company
+            state.extracted_signal.role = None
+            state.extracted_signal.city = card.city
+            state.extracted_signal.location_note = card.location_note
+            state.extracted_signal.ddl = card.ddl
+            state.extracted_signal.summary_one_line = overview_summary
+            state.extracted_signal.tags = overview_tags
+
+    def _dominant_activity_category(self, child_states: list[AgentState]) -> ContentCategory:
+        """Pick the dominant activity category from grouped child cards."""
+
+        counts: dict[ContentCategory, int] = {}
+        for child_state in child_states:
+            category = (
+                child_state.extracted_signal.category
+                if child_state.extracted_signal is not None
+                else child_state.classified_category
+            ) or ContentCategory.UNKNOWN
+            counts[category] = counts.get(category, 0) + 1
+        if not counts:
+            return ContentCategory.UNKNOWN
+        return max(counts.items(), key=lambda item: item[1])[0]
 
     def _is_recent_market_article(self, published_at: datetime | None, now: datetime) -> bool:
         """Keep market-watch refresh focused on source content from the last 24 hours."""
@@ -3066,14 +6605,64 @@ class ApiServiceContainer:
             return False
         if header_title in NON_SECTION_BRACKET_TITLES:
             return False
+        if self._is_non_section_action_title(line=line, header_title=header_title):
+            return False
+        if self._looks_like_inline_role_variant_title(line=line, header_title=header_title):
+            return False
         return bool(
             "【" in line
             or (
                 is_numbered_line
-                and any(
-                    keyword in line
-                    for keyword in ("内推", "实习", "校招", "秋招", "春招", "社招", "招聘")
+                and (
+                    any(
+                        keyword in line
+                        for keyword in ("内推", "实习", "校招", "秋招", "春招", "社招", "招聘")
+                    )
+                    or self._looks_like_job_section_title(header_title)
                 )
+            )
+        )
+
+    def _looks_like_job_section_title(self, header_title: str) -> bool:
+        """Return whether one numbered title looks like a real role/business card header."""
+
+        normalized = self._clean_section_title(header_title)
+        return bool(
+            self._contains_role_keyword(normalized)
+            or (
+                any(separator in normalized for separator in ("-", "／", "/", "|"))
+                and len(normalized) >= 4
+            )
+        )
+
+    def _looks_like_inline_role_variant_title(self, *, line: str, header_title: str) -> bool:
+        """Return whether one numbered line is only a child role bullet inside a section."""
+
+        if "【" in line or URL_PATTERN.search(line):
+            return False
+
+        normalized = self._clean_section_title(header_title)
+        if not normalized or len(normalized) > 24:
+            return False
+        if any(keyword in normalized for keyword in ("实习", "校招", "秋招", "春招", "社招", "招聘", "内推")):
+            return False
+        if not self._contains_role_keyword(normalized):
+            return False
+
+        if any(separator in normalized for separator in ("-", "／", "/", "|")):
+            left = re.split(r"[-/／|]", normalized, maxsplit=1)[0].strip()
+            if left and not self._contains_role_keyword(left):
+                return False
+
+        return True
+
+    def _contains_role_keyword(self, text: str) -> bool:
+        """Return whether a short phrase primarily looks like one role title."""
+
+        return bool(
+            re.search(
+                r"(工程师|研究员|分析师|经理|运营|产品|设计师|开发|算法|测试|架构师|顾问|专家|实习生)",
+                text,
             )
         )
 
@@ -3249,6 +6838,31 @@ class ApiServiceContainer:
         title = title.replace("【", " ").replace("】", " ")
         title = re.sub(r"\s+", " ", title).strip(" -")
         return title or "未命名岗位"
+
+    def _is_non_section_action_title(self, *, line: str, header_title: str) -> bool:
+        """Return whether one numbered line is just an apply/action instruction."""
+
+        normalized_title = self._normalize_submission_header_token(header_title)
+        normalized_line = self._normalize_submission_header_token(line)
+
+        if normalized_title in NON_SECTION_BRACKET_TITLES:
+            return True
+        if any(
+            normalized_title.startswith(prefix) or normalized_line.startswith(prefix)
+            for prefix in NON_SECTION_ACTION_PREFIXES
+        ):
+            return True
+        return (
+            ("http://" in line or "https://" in line)
+            and any(keyword in line for keyword in ("链接", "投递", "申请", "内推码"))
+        )
+
+    def _normalize_submission_header_token(self, value: str) -> str:
+        """Normalize one potential section title before header classification."""
+
+        normalized = re.sub(r"[：:（(].*$", "", value).strip()
+        normalized = re.sub(r"\s+", "", normalized)
+        return normalized
 
     def _extract_section_header_title(self, line: str) -> str | None:
         """Extract a stable section title from numbered lines with emoji or brackets."""
@@ -3718,6 +7332,13 @@ class ApiServiceContainer:
             source_type=state.source_type,
             workflow_status=state.status,
             source_ref=state.source_ref,
+            has_source_file=bool(state.source_metadata.get("archived_source_path")),
+            source_file_name=(
+                str(state.source_metadata.get("archived_source_name") or "").strip() or None
+            ),
+            source_file_path=(
+                str(state.source_metadata.get("archived_source_path") or "").strip() or None
+            ),
             updated_at=self._state_timestamp(state) or now_in_project_timezone(),
             message_time=self._coerce_datetime(
                 state.source_metadata.get("message_time")
@@ -3733,6 +7354,10 @@ class ApiServiceContainer:
             market_parent_item_id=str(state.source_metadata.get("market_parent_item_id") or "") or None,
             market_child_item_ids=list(state.source_metadata.get("market_child_item_ids", [])),
             market_child_previews=list(state.source_metadata.get("market_child_previews", [])),
+            job_group_kind=str(state.source_metadata.get("job_group_kind") or "") or None,
+            job_parent_item_id=str(state.source_metadata.get("job_parent_item_id") or "") or None,
+            job_child_item_ids=list(state.source_metadata.get("job_child_item_ids", [])),
+            job_child_previews=list(state.source_metadata.get("job_child_previews", [])),
             tags=extracted.tags if extracted else [],
         )
 

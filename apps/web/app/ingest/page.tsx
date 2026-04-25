@@ -1,14 +1,12 @@
 "use client";
 
-import { FormEvent, startTransition, useState } from "react";
+import { ChangeEvent, ClipboardEvent, FormEvent, startTransition, useRef, useState } from "react";
 
-import { AutoIngestResponse, IngestResult, apiRequest } from "../lib/api";
+import { IngestResult, UnifiedAttachmentResult, UnifiedIngestResponse, apiRequest } from "../lib/api";
 
-type IngestMode = "mixed" | "image";
-
-const modeLabels: Record<IngestMode, string> = {
-  mixed: "文本 / 链接",
-  image: "截图 OCR",
+type AttachedFile = {
+  id: string;
+  file: File;
 };
 
 function formatCardTime(result: IngestResult) {
@@ -25,7 +23,7 @@ function formatCardTime(result: IngestResult) {
 }
 
 export default function IngestPage() {
-  const [mode, setMode] = useState<IngestMode>("mixed");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<IngestResult[]>([]);
@@ -33,8 +31,38 @@ export default function IngestPage() {
   const [detectedInputKind, setDetectedInputKind] = useState<string | null>(null);
   const [analysisReasons, setAnalysisReasons] = useState<string[]>([]);
   const [visitedLinks, setVisitedLinks] = useState<string[]>([]);
+  const [attachments, setAttachments] = useState<UnifiedAttachmentResult[]>([]);
+  const [resolvedPaths, setResolvedPaths] = useState<string[]>([]);
   const [content, setContent] = useState("");
-  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+
+  function appendFiles(nextFiles: FileList | File[] | null) {
+    if (!nextFiles || nextFiles.length === 0) {
+      return;
+    }
+
+    const normalizedFiles = Array.from(nextFiles);
+    setAttachedFiles((current) => [
+      ...current,
+      ...normalizedFiles.map((file, index) => ({
+        id: `${file.name}-${file.size}-${file.lastModified}-${current.length + index}`,
+        file,
+      })),
+    ]);
+  }
+
+  function onFileChange(event: ChangeEvent<HTMLInputElement>) {
+    appendFiles(event.target.files);
+    event.target.value = "";
+  }
+
+  function onPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    appendFiles(event.clipboardData?.files ?? null);
+  }
+
+  function removeAttachedFile(targetId: string) {
+    setAttachedFiles((current) => current.filter((item) => item.id !== targetId));
+  }
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -42,39 +70,26 @@ export default function IngestPage() {
     setError(null);
 
     try {
-      if (mode === "mixed") {
-        const response = await apiRequest<AutoIngestResponse>("/ingest/auto", {
-          method: "POST",
-          body: JSON.stringify({ content }),
-        });
-        startTransition(() => {
-          setResults(response.data.results);
-          setTraceId(response.trace_id ?? null);
-          setDetectedInputKind(response.data.detected_input_kind);
-          setAnalysisReasons(response.data.analysis_reasons);
-          setVisitedLinks(response.data.visited_links);
-        });
-      }
+      const formData = new FormData();
+      formData.append("content", content);
+      attachedFiles.forEach(({ file }) => {
+        formData.append("files", file);
+      });
 
-      if (mode === "image") {
-        if (!imageFile) {
-          throw new Error("请先选择一张图片。");
-        }
-        const formData = new FormData();
-        formData.append("file", imageFile);
-
-        const response = await apiRequest<IngestResult>("/ingest/image-file", {
-          method: "POST",
-          body: formData,
-        });
-        startTransition(() => {
-          setResults([response.data]);
-          setTraceId(response.trace_id ?? null);
-          setDetectedInputKind("image");
-          setAnalysisReasons(["ocr upload"]);
-          setVisitedLinks([]);
-        });
-      }
+      const response = await apiRequest<UnifiedIngestResponse>("/ingest/unified", {
+        method: "POST",
+        body: formData,
+      });
+      startTransition(() => {
+        setResults(response.data.results);
+        setTraceId(response.trace_id ?? null);
+        setDetectedInputKind(response.data.detected_input_kind);
+        setAnalysisReasons(response.data.analysis_reasons);
+        setVisitedLinks(response.data.visited_links);
+        setAttachments(response.data.attachments);
+        setResolvedPaths(response.data.resolved_local_paths);
+        setAttachedFiles([]);
+      });
     } catch (requestError) {
       setError(
         requestError instanceof Error ? requestError.message : "提交失败，请稍后重试。",
@@ -87,56 +102,69 @@ export default function IngestPage() {
   return (
     <main className="dashboard-grid">
       <section className="hero panel panel-hero">
-        <p className="eyebrow">Input Workspace</p>
-        <h1>把文本、招聘链接和上下文放进同一个入口</h1>
+        <p className="eyebrow">Unified Composer</p>
+        <h1>一个聊天框，同时接文字、图片、PDF、文本文件和本地路径</h1>
         <p className="intro">
-          现在文本和链接共用一个输入框。后端会先判断你贴进来的内容类型，再决定是否访问链接、是否拆成多条岗位信息，以及怎样把上下文一起送进工作流。
+          现在输入页只保留一个消息框。你可以直接粘贴文本、在框里写本地图片或文件路径、粘贴截图/文件，
+          或点击按钮上传。图片会先走独立的 Qwen-VL-OCR，PDF/文本文件会先转文字，再进入同一条分析工作流。
         </p>
       </section>
 
       <section className="panel">
-        <div className="segmented-control">
-          {(Object.keys(modeLabels) as IngestMode[]).map((value) => (
-            <button
-              key={value}
-              type="button"
-              className={mode === value ? "segment segment-active" : "segment"}
-              onClick={() => setMode(value)}
-            >
-              {modeLabels[value]}
-            </button>
-          ))}
-        </div>
-
         <form className="stack-form" onSubmit={onSubmit}>
-          {mode === "mixed" ? (
-            <label className="field">
-              <span>输入内容</span>
-              <textarea
-                value={content}
-                onChange={(event) => setContent(event.target.value)}
-                placeholder="可以直接粘贴招聘文本、纯链接，或者“说明文字 + 一个或多个链接”"
-                rows={10}
-              />
-            </label>
-          ) : null}
+          <label className="field">
+            <span>输入消息</span>
+            <textarea
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              onPaste={onPaste}
+              placeholder={[
+                "可以直接输入：",
+                "1. 招聘文本 / 链接",
+                "2. 本地图片或文件路径（单独占一行）",
+                "3. 说明文字 + 路径 + 链接混合输入",
+              ].join("\n")}
+              rows={12}
+            />
+          </label>
 
-          {mode === "image" ? (
-            <>
-              <label className="field">
-                <span>上传截图</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={(event) =>
-                    setImageFile(event.target.files?.[0] ?? null)
-                  }
-                />
-              </label>
-              <p className="muted-text">
-                当前会先走本地 OCR，再把识别结果送进同一条工作流。
-              </p>
-            </>
+          <div className="composer-toolbar">
+            <button
+              type="button"
+              className="segment"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              上传图片 / 文件
+            </button>
+            <span className="muted-text">
+              支持图片、PDF、TXT/MD/JSON/CSV 等文本文件，也支持直接粘贴剪贴板里的图片或文件。
+            </span>
+          </div>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="image/*,.pdf,.txt,.md,.markdown,.json,.csv,.log,.yaml,.yml"
+            onChange={onFileChange}
+            hidden
+          />
+
+          {attachedFiles.length > 0 ? (
+            <div className="attachment-list">
+              {attachedFiles.map(({ id, file }) => (
+                <div key={id} className="attachment-chip">
+                  <span>{file.name}</span>
+                  <button
+                    type="button"
+                    className="segment"
+                    onClick={() => removeAttachedFile(id)}
+                  >
+                    移除
+                  </button>
+                </div>
+              ))}
+            </div>
           ) : null}
 
           <button className="primary-button" disabled={pending} type="submit">
@@ -150,7 +178,7 @@ export default function IngestPage() {
         {error ? <p className="error-text">{error}</p> : null}
         {results.length === 0 ? (
           <p className="muted-text">
-            提交一次输入后，这里会展示识别结果、访问过的链接以及生成的卡片。
+            提交后，这里会展示解析出来的文件、识别路径、访问过的链接和最终生成的卡片。
           </p>
         ) : (
           <div className="result-stack">
@@ -160,6 +188,9 @@ export default function IngestPage() {
                 <span className="metric-chip">类型 {detectedInputKind}</span>
               ) : null}
               <span className="metric-chip">生成卡片 {results.length}</span>
+              {attachments.length > 0 ? (
+                <span className="metric-chip">附件 {attachments.length}</span>
+              ) : null}
             </div>
 
             {analysisReasons.length > 0 ? (
@@ -169,6 +200,27 @@ export default function IngestPage() {
                     {reason}
                   </span>
                 ))}
+              </div>
+            ) : null}
+
+            {attachments.length > 0 ? (
+              <div className="routing-box">
+                <h3>已转文字的附件</h3>
+                <pre>
+                  {attachments
+                    .map(
+                      (attachment) =>
+                        `${attachment.display_name} | ${attachment.extraction_kind} | ${attachment.text_length} chars`,
+                    )
+                    .join("\n")}
+                </pre>
+              </div>
+            ) : null}
+
+            {resolvedPaths.length > 0 ? (
+              <div className="routing-box">
+                <h3>识别到的本地路径</h3>
+                <pre>{resolvedPaths.join("\n")}</pre>
               </div>
             ) : null}
 

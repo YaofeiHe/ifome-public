@@ -1,6 +1,18 @@
 """Chat orchestration package."""
 """Chat services and retrieval helpers."""
 
-from core.chat.rag import RAGChatResult, RAGChatService, RetrievedContext
+from core.chat.rag import (
+    QueryAnalysis,
+    RAGChatResult,
+    RAGChatService,
+    RAGDocument,
+    RetrievedContext,
+)
 
-__all__ = ["RAGChatResult", "RAGChatService", "RetrievedContext"]
+__all__ = [
+    "QueryAnalysis",
+    "RAGChatResult",
+    "RAGChatService",
+    "RAGDocument",
+    "RetrievedContext",
+]

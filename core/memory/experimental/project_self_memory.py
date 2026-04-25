@@ -54,6 +54,8 @@ class ProjectSelfMemoryService:
             tech_stack=payload.tech_stack,
             highlight_points=payload.highlight_points,
             interview_story_hooks=payload.interview_story_hooks,
+            source_file_name=None,
+            source_file_path=None,
         )
 
         remaining_projects = [

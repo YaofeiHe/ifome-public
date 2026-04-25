@@ -124,6 +124,27 @@ class AutoIngestResponse(BaseModel):
     results: list[IngestResult] = Field(default_factory=list)
 
 
+class UnifiedAttachmentResult(BaseModel):
+    """One attachment converted to text before entering the workflow."""
+
+    display_name: str = Field(description="Human-readable attachment label.")
+    source_ref: str = Field(description="Original uploaded file name or local path.")
+    source_type: str = Field(description="Source type used for downstream workflow runs.")
+    extraction_kind: str = Field(description="How the attachment was converted into text.")
+    text_length: int = Field(description="Character length of the extracted text.")
+
+
+class UnifiedIngestResponse(BaseModel):
+    """Result returned by the single-composer unified ingest endpoint."""
+
+    detected_input_kind: str = Field(description="Aggregate input kind after text/path/file merge.")
+    visited_links: list[str] = Field(default_factory=list)
+    analysis_reasons: list[str] = Field(default_factory=list)
+    results: list[IngestResult] = Field(default_factory=list)
+    attachments: list[UnifiedAttachmentResult] = Field(default_factory=list)
+    resolved_local_paths: list[str] = Field(default_factory=list)
+
+
 class BossZhipinJobIngestRequest(BaseModel):
     """Payload for Boss 直聘岗位详情接入。"""
 
@@ -181,6 +202,72 @@ class MemoryResponse(BaseModel):
     career_state_memory: CareerStateMemory | None = Field(
         default=None, description="Career-state memory snapshot after update."
     )
+
+
+class RuntimeProviderSettingsPayload(BaseModel):
+    """Client-facing runtime settings payload for one provider section."""
+
+    enabled: bool = Field(default=False)
+    api_key: str | None = Field(default=None)
+    base_url: str | None = Field(default=None)
+    model: str | None = Field(default=None)
+    fallback_models: list[str] = Field(default_factory=list)
+    request_timeout_seconds: int = Field(default=30, ge=1, le=300)
+
+
+class RuntimeOCRSettingsPayload(BaseModel):
+    """Client-facing runtime settings payload for OCR."""
+
+    enabled: bool = Field(default=False)
+    provider_label: str = Field(default="Qwen-VL-OCR")
+    api_key: str | None = Field(default=None)
+    base_url: str | None = Field(default=None)
+    model: str | None = Field(default="qwen-vl-ocr")
+    request_timeout_seconds: int = Field(default=60, ge=1, le=300)
+
+
+class SourceFileSettingsPayload(BaseModel):
+    """Client-facing runtime settings payload for source file retention."""
+
+    max_age_days: int = Field(default=30, ge=1, le=3650)
+    max_total_size_mb: int = Field(default=2048, ge=64, le=102400)
+    delete_when_item_deleted: bool = Field(default=True)
+    filter_patterns: list[str] = Field(default_factory=list)
+
+
+class RuntimeSettingsResponse(BaseModel):
+    """Local runtime settings returned to the dedicated settings page."""
+
+    llm: RuntimeProviderSettingsPayload = Field(
+        default_factory=RuntimeProviderSettingsPayload
+    )
+    ocr: RuntimeOCRSettingsPayload = Field(default_factory=RuntimeOCRSettingsPayload)
+    source_files: SourceFileSettingsPayload = Field(default_factory=SourceFileSettingsPayload)
+
+
+class RuntimeSettingsUpdateRequest(BaseModel):
+    """Request body for updating local runtime settings."""
+
+    llm: RuntimeProviderSettingsPayload = Field(
+        default_factory=RuntimeProviderSettingsPayload
+    )
+    ocr: RuntimeOCRSettingsPayload = Field(default_factory=RuntimeOCRSettingsPayload)
+    source_files: SourceFileSettingsPayload = Field(default_factory=SourceFileSettingsPayload)
+
+
+class SourceFileCleanupReport(BaseModel):
+    """Summary returned after one source file cleanup pass."""
+
+    trigger: str = Field(default="manual")
+    scanned_file_count: int = Field(default=0)
+    deleted_file_count: int = Field(default=0)
+    reclaimed_bytes: int = Field(default=0)
+    remaining_bytes: int = Field(default=0)
+    deleted_orphan_file_count: int = Field(default=0)
+    deleted_due_to_age_count: int = Field(default=0)
+    deleted_due_to_size_count: int = Field(default=0)
+    deleted_due_to_filter_count: int = Field(default=0)
+    deleted_paths: list[str] = Field(default_factory=list)
 
 
 class ProfileMemoryWriteRequest(BaseModel):
@@ -253,6 +340,10 @@ class ChatQueryRequest(BaseModel):
     )
     user_id: str = Field(default="demo_user", description="Logical user identifier.")
     workspace_id: str | None = Field(default="demo_workspace")
+    apply_memory_updates: bool = Field(
+        default=True,
+        description="Whether the chat flow may persist low-risk profile and career updates.",
+    )
 
 
 class ChatCitation(BaseModel):
@@ -263,6 +354,55 @@ class ChatCitation(BaseModel):
     source_label: str = Field(description="Human-readable source label.")
     snippet: str = Field(description="Compact snippet shown to the user.")
     score: float = Field(description="Final retrieval or rerank score.")
+
+
+class ChatQueryPlan(BaseModel):
+    """Preprocessed chat intent and retrieval hints."""
+
+    intent: str = Field(default="general_grounded_chat")
+    search_hints: list[str] = Field(default_factory=list)
+    rewritten_query: str | None = Field(default=None)
+    retrieval_queries: list[str] = Field(default_factory=list)
+    web_search_queries: list[str] = Field(default_factory=list)
+    profile_update_hints: list[str] = Field(default_factory=list)
+    career_update_hints: list[str] = Field(default_factory=list)
+    should_update_memory: bool = Field(default=False)
+    needs_resume: bool = Field(default=False)
+    recent_days: int = Field(default=30)
+
+
+class ChatMemoryUpdate(BaseModel):
+    """Summary of memory fields updated during chat preprocessing."""
+
+    applied: bool = Field(default=False)
+    profile_fields: list[str] = Field(default_factory=list)
+    career_fields: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class ChatAttachmentDiagnostic(BaseModel):
+    """One chat attachment processed before retrieval."""
+
+    display_name: str = Field(description="Human-readable attachment name.")
+    source_ref: str = Field(description="Original attachment reference.")
+    extraction_kind: str = Field(description="How the attachment text was extracted.")
+    attachment_kind: str = Field(
+        default="document",
+        description="Lightweight classifier such as resume or document.",
+    )
+    summary: str = Field(
+        default="",
+        description="Compact summary of what the attachment mainly says.",
+    )
+    persisted_to_profile: bool = Field(
+        default=False,
+        description="Whether this attachment was written into long-term profile memory.",
+    )
+    text_length: int = Field(description="Character length of extracted attachment text.")
+    processing_error: str | None = Field(
+        default=None,
+        description="Attachment processing error when text extraction did not succeed.",
+    )
 
 
 class ChatQueryResponse(BaseModel):
@@ -279,6 +419,18 @@ class ChatQueryResponse(BaseModel):
     retrieval_mode: str = Field(
         default="local_lexical",
         description="Which retrieval path produced the final context set.",
+    )
+    query_plan: ChatQueryPlan | None = Field(
+        default=None,
+        description="Preprocessed task intent and retrieval hints for debugging.",
+    )
+    memory_update: ChatMemoryUpdate | None = Field(
+        default=None,
+        description="Summary of conservative memory updates applied during chat.",
+    )
+    attachments: list[ChatAttachmentDiagnostic] = Field(
+        default_factory=list,
+        description="Files or local paths processed specifically for this chat turn.",
     )
 
 

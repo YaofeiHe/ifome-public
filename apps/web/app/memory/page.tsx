@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 
-import { MemoryResponse, apiRequest } from "../lib/api";
+import { API_BASE_URL, MemoryResponse, apiRequest } from "../lib/api";
 
 function parseLines(value: string) {
   return value
@@ -11,41 +11,77 @@ function parseLines(value: string) {
     .filter(Boolean);
 }
 
+function joinLines(values: string[] | undefined) {
+  return (values ?? []).join("\n");
+}
+
 const DEFAULT_MARKET_WATCH_SOURCES = [
   "https://www.jiqizhixin.com/",
   "https://www.qbitai.com/",
 ];
 
 export default function MemoryPage() {
-  const [targetRoles, setTargetRoles] = useState(
-    "AI 应用工程师\n智能体平台工程师\nLLM 应用后端\nAI 搜索工程师\nRAG/知识库工程师",
-  );
-  const [priorityDomains, setPriorityDomains] = useState(
-    "AI 大模型工程化\n企业级 agent 平台\n办公 agent\n编程 agent\nAI 搜索与信息助手\n本地生活与旅行 agent\n电商经营与客服 agent\n产业与医疗 agent\n智能驾驶",
-  );
-  const [skills, setSkills] = useState("Python\nFastAPI\nRAG\nAgent\nMCP\n评测\n工作流编排");
-  const [locations, setLocations] = useState("上海\n杭州\n北京\n远程");
-  const [softPreferences, setSoftPreferences] = useState(
-    "高匹配岗位优先\n有明确 DDL 更好\n优先关注 AI agent 工程化相关岗位",
-  );
+  const [targetRoles, setTargetRoles] = useState("");
+  const [priorityDomains, setPriorityDomains] = useState("");
+  const [skills, setSkills] = useState("");
+  const [locations, setLocations] = useState("");
+  const [softPreferences, setSoftPreferences] = useState("");
   const [excludedCompanies, setExcludedCompanies] = useState("");
-  const [summary, setSummary] = useState(
-    "重点关注中国市场里 AI agent 工程化应用岗位，不局限于智能驾驶，同时覆盖企业级智能体平台、办公 agent、编程 agent、AI 搜索助手和电商 agent。",
-  );
+  const [summary, setSummary] = useState("");
 
-  const [watchedCompanies, setWatchedCompanies] = useState("阿里云\n钉钉\n夸克\n高德\n淘天");
+  const [watchedCompanies, setWatchedCompanies] = useState("");
   const [marketWatchSources, setMarketWatchSources] = useState(DEFAULT_MARKET_WATCH_SOURCES);
   const [marketArticleFetchLimit, setMarketArticleFetchLimit] = useState("5");
-  const [todayFocus, setTodayFocus] = useState("筛选高匹配岗位\n跟进 AI agent 工程化方向的市场信号");
-  const [activePriorities, setActivePriorities] = useState(
-    "重要时间点不遗漏\n今天先投高匹配岗位\n持续更新市场信息",
-  );
-  const [notes, setNotes] = useState("当前优先关注 AI agent 工程化相关岗位与市场动态。");
+  const [todayFocus, setTodayFocus] = useState("");
+  const [activePriorities, setActivePriorities] = useState("");
+  const [notes, setNotes] = useState("");
 
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [loadingSnapshot, setLoadingSnapshot] = useState(true);
   const [lastSnapshot, setLastSnapshot] = useState<MemoryResponse | null>(null);
+
+  useEffect(() => {
+    async function loadMemory() {
+      try {
+        const response = await apiRequest<MemoryResponse>("/memory");
+        const snapshot = response.data;
+        setLastSnapshot(snapshot);
+
+        if (snapshot.profile_memory) {
+          setTargetRoles(joinLines(snapshot.profile_memory.target_roles));
+          setPriorityDomains(joinLines(snapshot.profile_memory.priority_domains));
+          setSkills(joinLines(snapshot.profile_memory.skills));
+          setLocations(joinLines(snapshot.profile_memory.location_preferences));
+          setSoftPreferences(joinLines(snapshot.profile_memory.soft_preferences));
+          setExcludedCompanies(joinLines(snapshot.profile_memory.excluded_companies));
+          setSummary(snapshot.profile_memory.summary ?? "");
+        }
+
+        if (snapshot.career_state_memory) {
+          setWatchedCompanies(joinLines(snapshot.career_state_memory.watched_companies));
+          setMarketWatchSources(
+            snapshot.career_state_memory.market_watch_sources.length > 0
+              ? snapshot.career_state_memory.market_watch_sources
+              : DEFAULT_MARKET_WATCH_SOURCES,
+          );
+          setMarketArticleFetchLimit(String(snapshot.career_state_memory.market_article_fetch_limit));
+          setTodayFocus(joinLines(snapshot.career_state_memory.today_focus));
+          setActivePriorities(joinLines(snapshot.career_state_memory.active_priorities));
+          setNotes(snapshot.career_state_memory.notes ?? "");
+        }
+      } catch (requestError) {
+        setError(
+          requestError instanceof Error ? requestError.message : "读取 memory 快照失败。",
+        );
+      } finally {
+        setLoadingSnapshot(false);
+      }
+    }
+
+    void loadMemory();
+  }, []);
 
   async function submitProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -109,20 +145,25 @@ export default function MemoryPage() {
     }
   }
 
+  const resumeSnapshot = lastSnapshot?.profile_memory?.resume_snapshot ?? null;
+  const projectEntries = lastSnapshot?.profile_memory?.projects ?? [];
+  const resumeFileUrl = `${API_BASE_URL}/memory/profile/resume-file`;
+
   return (
     <main className="dashboard-grid">
-      <section className="hero panel panel-hero">
-        <p className="eyebrow">Memory Control</p>
-        <h1>把长期画像和当前状态拆开管理</h1>
-        <p className="intro">
-          这里对应两个不同接口：`/memory/profile` 和 `/memory/career-state`。前者存稳定偏好，后者存近期状态。
-        </p>
-      </section>
+      <div className="memory-page-shell">
+        <section className="hero panel panel-hero">
+          <p className="eyebrow">Memory Control</p>
+          <h1>把长期画像、动态状态、项目画像和简历资料拆开管理</h1>
+          <p className="intro">
+            这里现在除了 `profile` 和 `career-state` 之外，还会展示聊天上传后即时整理好的项目画像和简历网页版本。你可以直接打开源文件，也可以把整理好的条目拷去其他表单或后续工具调用。
+          </p>
+        </section>
 
-      {message ? <section className="panel success-banner">{message}</section> : null}
-      {error ? <section className="panel error-banner">{error}</section> : null}
+        {message ? <section className="panel success-banner">{message}</section> : null}
+        {error ? <section className="panel error-banner">{error}</section> : null}
 
-      <section className="memory-grid">
+        <section className="memory-grid">
         <form className="panel stack-form" onSubmit={submitProfile}>
           <h2>长期画像</h2>
           <label className="field">
@@ -237,16 +278,157 @@ export default function MemoryPage() {
             {pending ? "保存中..." : "保存动态状态"}
           </button>
         </form>
-      </section>
+        </section>
 
-      <section className="panel">
-        <h2>最近回写结果</h2>
-        {!lastSnapshot ? (
-          <p className="muted-text">提交一次 profile 或 career-state 后，这里会展示最新回写结果。</p>
+        <section className="panel memory-secondary-panel">
+        <h2>项目画像</h2>
+        {loadingSnapshot ? (
+          <p className="muted-text">正在读取当前 memory 快照...</p>
+        ) : projectEntries.length === 0 ? (
+          <p className="muted-text">
+            还没有导入项目说明。你可以在聊天框上传 README、项目说明、架构设计或方案文档，系统会自动整理成项目画像并在后续聊天里参与检索。
+          </p>
         ) : (
-          <pre className="snapshot-box">{JSON.stringify(lastSnapshot, null, 2)}</pre>
+          <div className="result-stack">
+            {projectEntries.map((project) => {
+              const projectFileUrl = `${API_BASE_URL}/memory/profile/project-file?project_name=${encodeURIComponent(project.name)}`;
+              return (
+                <article key={project.name} className="panel panel-subtle">
+                  <div className="metric-row">
+                    <span className="metric-chip">{project.name}</span>
+                    {project.role ? <span className="metric-chip">{project.role}</span> : null}
+                    {project.source_file_name ? <span className="metric-chip">{project.source_file_name}</span> : null}
+                  </div>
+                  <p>{project.summary}</p>
+                  {project.tech_stack.length > 0 ? (
+                    <div className="tag-row">
+                      {project.tech_stack.map((value) => (
+                        <span key={value} className="tag-chip">
+                          {value}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  {project.highlight_points.length > 0 ? (
+                    <div className="result-stack">
+                      <h3>亮点整理</h3>
+                      {project.highlight_points.map((value) => (
+                        <p key={value} className="muted-text">
+                          {value}
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {project.interview_story_hooks.length > 0 ? (
+                    <div className="result-stack">
+                      <h3>面试切入口</h3>
+                      {project.interview_story_hooks.map((value) => (
+                        <p key={value} className="muted-text">
+                          {value}
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {project.source_file_name ? (
+                    <p>
+                      <a className="segment" href={projectFileUrl} rel="noreferrer" target="_blank">
+                        打开项目源文件
+                      </a>
+                    </p>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
         )}
-      </section>
+        </section>
+
+        <section className="panel memory-secondary-panel">
+        <h2>简历资料</h2>
+        {loadingSnapshot ? (
+          <p className="muted-text">正在读取当前 memory 快照...</p>
+        ) : !resumeSnapshot ? (
+          <p className="muted-text">
+            还没有导入简历。你可以在聊天框上传简历 PDF/图片/文本，系统会自动提取原文、结构化整理，并在这里显示。
+          </p>
+        ) : (
+          <div className="result-stack">
+            <div className="metric-row">
+              {resumeSnapshot.file_name ? (
+                <span className="metric-chip">{resumeSnapshot.file_name}</span>
+              ) : null}
+              {resumeSnapshot.updated_at ? (
+                <span className="metric-chip">更新于 {resumeSnapshot.updated_at}</span>
+              ) : null}
+            </div>
+
+            <div className="routing-box">
+              <h3>导入源文件</h3>
+              <p className="muted-text">
+                {resumeSnapshot.source_file_name || resumeSnapshot.file_name || "已归档简历源文件"}
+              </p>
+              <p>
+                <a className="segment" href={resumeFileUrl} rel="noreferrer" target="_blank">
+                  打开简历 PDF 源文件
+                </a>
+              </p>
+            </div>
+
+            {resumeSnapshot.summary ? (
+              <div className="routing-box">
+                <h3>简历摘要</h3>
+                <p>{resumeSnapshot.summary}</p>
+              </div>
+            ) : null}
+
+            {resumeSnapshot.structured_profile?.headline ? (
+              <div className="routing-box">
+                <h3>网页版概览</h3>
+                <p>{resumeSnapshot.structured_profile.headline}</p>
+              </div>
+            ) : null}
+
+            {resumeSnapshot.structured_profile?.sections?.length ? (
+              <div className="result-stack">
+                <h3>网页整理版</h3>
+                {resumeSnapshot.structured_profile.sections.map((section) => (
+                  <article key={section.title} className="panel panel-subtle">
+                    <p>
+                      <strong>{section.title}</strong>
+                    </p>
+                    {section.items.length > 0 ? (
+                      <div className="result-stack">
+                        {section.items.map((item) => (
+                          <p key={item} className="muted-text">
+                            {item}
+                          </p>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="muted-text">暂无条目。</p>
+                    )}
+                  </article>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="routing-box">
+              <h3>简历原文</h3>
+              <pre>{resumeSnapshot.text}</pre>
+            </div>
+          </div>
+        )}
+        </section>
+
+        <section className="panel memory-secondary-panel">
+          <h2>最近回写结果</h2>
+          {!lastSnapshot ? (
+            <p className="muted-text">提交一次 profile、career-state 或简历导入后，这里会展示最新回写结果。</p>
+          ) : (
+            <pre className="snapshot-box memory-snapshot-box">{JSON.stringify(lastSnapshot, null, 2)}</pre>
+          )}
+        </section>
+      </div>
     </main>
   );
 }

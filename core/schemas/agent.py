@@ -129,6 +129,18 @@ class RenderedItemCard(SchemaModel):
         default=None,
         description="Original URL, file name, or connector reference.",
     )
+    has_source_file: bool = Field(
+        default=False,
+        description="Whether one archived local source file is available for direct access.",
+    )
+    source_file_name: str | None = Field(
+        default=None,
+        description="Archived local source file name when available.",
+    )
+    source_file_path: str | None = Field(
+        default=None,
+        description="Absolute archived local source file path when available.",
+    )
     updated_at: datetime | None = Field(
         default=None,
         description="Timezone-aware timestamp of the latest card update."
@@ -172,6 +184,22 @@ class RenderedItemCard(SchemaModel):
     market_child_previews: list[str] = Field(
         default_factory=list,
         description="Short preview labels shown before expanding grouped market articles.",
+    )
+    job_group_kind: str | None = Field(
+        default=None,
+        description="Grouped activity-card kind such as overview or role.",
+    )
+    job_parent_item_id: str | None = Field(
+        default=None,
+        description="Parent activity card id when this card is a grouped child role.",
+    )
+    job_child_item_ids: list[str] = Field(
+        default_factory=list,
+        description="Child activity item ids linked from one overview card.",
+    )
+    job_child_previews: list[str] = Field(
+        default_factory=list,
+        description="Short preview labels shown before expanding grouped activity cards.",
     )
     tags: list[str] = Field(
         default_factory=list,

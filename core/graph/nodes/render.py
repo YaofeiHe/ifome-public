@@ -83,6 +83,13 @@ class RenderNode(WorkflowNode):
             source_type=state.source_type,
             workflow_status=state.status,
             source_ref=state.source_ref,
+            has_source_file=bool(state.source_metadata.get("archived_source_path")),
+            source_file_name=(
+                str(state.source_metadata.get("archived_source_name") or "").strip() or None
+            ),
+            source_file_path=(
+                str(state.source_metadata.get("archived_source_path") or "").strip() or None
+            ),
             updated_at=now_in_project_timezone(),
             message_time=_parse_message_time(
                 state.source_metadata.get("message_time")
@@ -98,6 +105,10 @@ class RenderNode(WorkflowNode):
             market_parent_item_id=str(state.source_metadata.get("market_parent_item_id") or "") or None,
             market_child_item_ids=list(state.source_metadata.get("market_child_item_ids", [])),
             market_child_previews=list(state.source_metadata.get("market_child_previews", [])),
+            job_group_kind=str(state.source_metadata.get("job_group_kind") or "") or None,
+            job_parent_item_id=str(state.source_metadata.get("job_parent_item_id") or "") or None,
+            job_child_item_ids=list(state.source_metadata.get("job_child_item_ids", [])),
+            job_child_previews=list(state.source_metadata.get("job_child_previews", [])),
             tags=extracted.tags if extracted else [],
         )
         if extracted is not None:

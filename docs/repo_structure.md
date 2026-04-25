@@ -38,7 +38,7 @@
 这里最近多了一层很值得在面试里强调的职责：
 
 - `services.py` 不只是把请求转发给工作流
-- 它还负责 submission analysis、prompt 标准化、画像引导的主题识别、one-shot 搜索扩词、显式搜索参考注入、section split、role variant expand、长公告 campaign card 推断、平台无关关系标签生成、抓取计划生成、逐链接访问判断、低上下文链接强制抓取、市场信息刷新和候选卡片编排
+- 它还负责 submission analysis、prompt 标准化、画像引导的主题识别、one-shot 搜索扩词、显式搜索参考注入、section split、role variant expand、长公告 campaign card 推断、平台无关关系标签生成、抓取计划生成、逐链接访问判断、低上下文链接强制抓取、附件与本地文件先转文本、市场信息刷新和候选卡片编排
 - 现在市场信息刷新里又多了一层“基础网址 -> 站点级标题抓取或站点专用搜索适配器 -> 关键词规则排序并保留 1 篇探索项 -> 按记忆配置的文章上限抓正文 -> 大卡片/小卡片组织 -> 去重/历史清理”的编排
 - 当标题搜索层拿不到结果时，`services.py` 还会回退到来源站点首页抓取，保证市场刷新仍然有可用产出
 - 所以多岗位合集输入的应用层 orchestration 主要落在这里，而不是放进前端或持久化层
@@ -66,7 +66,7 @@
 - `apps/web/app/page.tsx`：首页总览。
 - `apps/web/app/ingest/page.tsx`：统一文本 / 链接输入页和截图输入页。
 - `apps/web/app/items/page.tsx`：卡片列表页，支持编辑、删除、批量删除和详情查看。
-- `apps/web/app/items/page.tsx`：卡片列表页，支持点击切换 `求职活动 / 市场信息`、编辑、删除、批量删除、详情查看、市场总览卡片下“展开文章列表（N）”按钮触发的小卡片列表展开，以及收敛后的单一市场刷新按钮与市场信息区直接显示批量删除入口。
+- `apps/web/app/items/page.tsx`：卡片列表页，支持点击切换 `求职活动 / 市场信息`、编辑、删除、批量删除、详情查看、市场总览卡片下“展开文章列表（N）”按钮触发的小卡片列表展开，也支持求职活动里的多岗位 overview 卡下“展开岗位列表（N）”查看子岗位卡片，以及收敛后的单一市场刷新按钮与市场信息区直接显示批量删除入口。
 - `apps/web/app/items/page.tsx`：同时负责把列表里的所有时间统一格式化成 `年月日 + 时分秒` 的前端显示格式。
 - `apps/web/app/memory/page.tsx`：记忆管理页，市场监控源通过可滚动表格维护，并且可以直接配置每个来源单次刷新时的市场文章抓取上限。
 - `apps/web/app/chat/page.tsx`：聊天控制台页，支持按时间窗口做近期卡片检索。
@@ -94,10 +94,11 @@
 
 最近值得点名的节点变化：
 
-- `extract.py`：会优先结合 `source_title / role_variant / semantic_tags` 稳定岗位抽取
+- `classify.py`：先走规则分类和 SQLite 里的已有卡片参考，只有在低置信度或边界样本时才升级到 LLM
+- `extract.py`：会优先结合 `source_title / role_variant / semantic_tags` 稳定岗位抽取；规则抽取不完整时，再把关键词提示、自动关键词搜索参考、显式搜索参考、SQLite 历史卡片和可用向量召回一起组织进 LLM prompt
 - `extract.py`：会把共享上下文里的全局 DDL 传播到岗位 / 内推类卡片
-- `persist.py`：会基于岗位身份键去重，避免同一个招聘站里的多个岗位方向被误合并
-- `render.py`：会把地点待识别说明一起返回到卡片层
+- `persist.py`：会先做结构化键和 heuristic score 的去重判断，只有落入模糊区间才调用 LLM，避免每张卡都走一遍语义去重
+- `render.py`：会把地点待识别说明和求职 overview 父卡 / 子卡关系一起返回到卡片层
 
 ### `core/runtime`
 
@@ -161,6 +162,7 @@
 - `core/extraction/normalize.py`：输入清洗和标准化。
 - `core/extraction/parse.py`：规则分类和规则抽取。
 - `core/extraction/live_llm.py`：真实模型 classify / extract 接入。
+- `core/extraction/prompt_context.py`：把 SQLite 历史卡片、显式搜索参考和可用的向量召回整理成给 classify / extract / dedupe 的 prompt 参考上下文。
 
 这层最近新增的实用点：
 
@@ -168,6 +170,8 @@
 - 在没有明确城市时，可以生成“地点待识别，可能为线上，需投递后确认”这类说明
 - 对“算法工程师-生成器式方向 / 数据研发工程师”这类岗位方向的角色抽取更稳
 - 关系识别不再局限于阿里系，改成了平台无关的 `family / stage / unit / identity_tag` 结构
+- `classify / extract / dedupe` 不再是无脑每次先调 LLM，而是先走规则和已有卡片检索，只有在低置信度或模糊区间才升级到 LLM
+- 新增的 `prompt_context.py` 会把自动关键词搜索结果、显式搜索参考、SQLite 相似卡片和可用向量召回整理成统一 prompt 参考，给分类、抽取和去重复用
 
 ### `core/ranking`
 
@@ -226,6 +230,7 @@
 关键文件：
 
 - `core/tools/llm_client.py`：OpenAI-compatible live LLM 适配器。
+- `core/tools/ocr_client.py`：图片 OCR 适配器，默认复用通用 LLM 的多模态能力；若启用独立 OCR 配置则优先走独立 OCR，否则回退本地 `tesseract`。
 - `core/tools/embedding_client.py`：DashScope embedding 适配器。
 - `core/tools/prompt_loader.py`：Prompt 读取器。
 - `core/tools/search_client.py`：one-shot web search 适配器，用于在画像引导主题识别之后扩公司 / 业务线关键词，也用于发现市场监控源最近 24 小时的标题/链接候选；当前不能保证抓到站点“全部”文章，只能消费搜索结果返回的候选集合。

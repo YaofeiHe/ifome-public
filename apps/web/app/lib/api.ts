@@ -27,6 +27,9 @@ export type RenderedItemCard = {
   source_type: "text" | "link" | "image" | null;
   workflow_status: string;
   source_ref: string | null;
+  has_source_file: boolean;
+  source_file_name: string | null;
+  source_file_path: string | null;
   updated_at: string | null;
   message_time: string | null;
   generated_at: string | null;
@@ -38,6 +41,10 @@ export type RenderedItemCard = {
   market_parent_item_id: string | null;
   market_child_item_ids: string[];
   market_child_previews: string[];
+  job_group_kind: string | null;
+  job_parent_item_id: string | null;
+  job_child_item_ids: string[];
+  job_child_previews: string[];
   tags: string[];
 };
 
@@ -66,6 +73,23 @@ export type AutoIngestResponse = {
   results: IngestResult[];
 };
 
+export type UnifiedAttachmentResult = {
+  display_name: string;
+  source_ref: string;
+  source_type: string;
+  extraction_kind: string;
+  text_length: number;
+};
+
+export type UnifiedIngestResponse = {
+  detected_input_kind: string;
+  visited_links: string[];
+  analysis_reasons: string[];
+  results: IngestResult[];
+  attachments: UnifiedAttachmentResult[];
+  resolved_local_paths: string[];
+};
+
 export type ItemListResponse = {
   items: RenderedItemCard[];
 };
@@ -79,10 +103,40 @@ export type MemoryResponse = {
     target_roles: string[];
     priority_domains: string[];
     skills: string[];
+    persona_keywords: string[];
+    projects: {
+      name: string;
+      summary: string;
+      role: string | null;
+      tech_stack: string[];
+      highlight_points: string[];
+      interview_story_hooks: string[];
+      source_file_name: string | null;
+      source_file_path: string | null;
+    }[];
     location_preferences: string[];
     soft_preferences: string[];
     excluded_companies: string[];
     summary: string | null;
+    resume_snapshot:
+      | {
+          file_name: string | null;
+          source_file_name: string | null;
+          source_file_path: string | null;
+          text: string;
+          summary: string | null;
+          structured_profile:
+            | {
+                headline: string | null;
+                sections: {
+                  title: string;
+                  items: string[];
+                }[];
+              }
+            | null;
+          updated_at: string;
+        }
+      | null;
   } | null;
   career_state_memory: {
     watched_companies: string[];
@@ -93,6 +147,50 @@ export type MemoryResponse = {
     notes: string | null;
     last_market_refresh_at: string | null;
   } | null;
+};
+
+export type RuntimeProviderSettingsPayload = {
+  enabled: boolean;
+  api_key: string | null;
+  base_url: string | null;
+  model: string | null;
+  fallback_models: string[];
+  request_timeout_seconds: number;
+};
+
+export type RuntimeOCRSettingsPayload = {
+  enabled: boolean;
+  provider_label: string;
+  api_key: string | null;
+  base_url: string | null;
+  model: string | null;
+  request_timeout_seconds: number;
+};
+
+export type SourceFileSettingsPayload = {
+  max_age_days: number;
+  max_total_size_mb: number;
+  delete_when_item_deleted: boolean;
+  filter_patterns: string[];
+};
+
+export type SourceFileCleanupReport = {
+  trigger: string;
+  scanned_file_count: number;
+  deleted_file_count: number;
+  reclaimed_bytes: number;
+  remaining_bytes: number;
+  deleted_orphan_file_count: number;
+  deleted_due_to_age_count: number;
+  deleted_due_to_size_count: number;
+  deleted_due_to_filter_count: number;
+  deleted_paths: string[];
+};
+
+export type RuntimeSettingsResponse = {
+  llm: RuntimeProviderSettingsPayload;
+  ocr: RuntimeOCRSettingsPayload;
+  source_files: SourceFileSettingsPayload;
 };
 
 export type ChatQueryResponse = {
@@ -106,6 +204,34 @@ export type ChatQueryResponse = {
     score: number;
   }[];
   retrieval_mode: string;
+  query_plan?: {
+    intent: string;
+    search_hints: string[];
+    rewritten_query?: string | null;
+    retrieval_queries?: string[];
+    web_search_queries?: string[];
+    profile_update_hints: string[];
+    career_update_hints: string[];
+    should_update_memory: boolean;
+    needs_resume: boolean;
+    recent_days: number;
+  } | null;
+  memory_update?: {
+    applied: boolean;
+    profile_fields: string[];
+    career_fields: string[];
+    notes: string[];
+  } | null;
+  attachments?: {
+    display_name: string;
+    source_ref: string;
+    extraction_kind: string;
+    attachment_kind: string;
+    summary: string;
+    persisted_to_profile: boolean;
+    text_length: number;
+    processing_error?: string | null;
+  }[];
 };
 
 export type ItemDetailResponse = {
@@ -172,7 +298,7 @@ export type MarketRefreshResponse = {
   results: IngestResult[];
 };
 
-const API_BASE_URL =
+export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 export async function apiRequest<T>(

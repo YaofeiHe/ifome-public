@@ -12,6 +12,7 @@ import {
   RenderedItemCard,
   apiRequest,
 } from "../lib/api";
+import { MARKET_REFRESH_EVENT } from "../components/market-refresh-bootstrap";
 
 type EditDraft = {
   summary_one_line: string;
@@ -56,12 +57,21 @@ function looksLikeUrl(value: string | null | undefined) {
   return Boolean(value && /^https?:\/\//i.test(value));
 }
 
+function getSourceFileHref(itemId: string) {
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+  return `${apiBaseUrl}/items/${itemId}/source-file`;
+}
+
 function isMarketItem(item: RenderedItemCard) {
   return item.is_market_signal || item.content_category === "general_update";
 }
 
 function isMarketChildItem(item: RenderedItemCard) {
   return isMarketItem(item) && item.market_group_kind === "article" && Boolean(item.market_parent_item_id);
+}
+
+function isJobChildItem(item: RenderedItemCard) {
+  return item.job_group_kind === "role" && Boolean(item.job_parent_item_id);
 }
 
 function getMarketPreviewCount(
@@ -76,6 +86,42 @@ function getMarketPreviewCount(
   );
 }
 
+function getJobPreviewCount(
+  item: RenderedItemCard,
+  childrenByParent: Map<string, RenderedItemCard[]>,
+) {
+  const loadedChildren = childrenByParent.get(item.item_id)?.length || 0;
+  return Math.max(
+    loadedChildren,
+    item.job_child_item_ids.length,
+    item.job_child_previews.length,
+  );
+}
+
+function getOrderedChildCards(
+  item: RenderedItemCard,
+  itemMap: Map<string, RenderedItemCard>,
+  childrenByParent: Map<string, RenderedItemCard[]>,
+) {
+  const explicitChildren: RenderedItemCard[] = [];
+  const explicitIds = new Set<string>();
+  const childIds = isMarketItem(item)
+    ? item.market_child_item_ids || []
+    : item.job_child_item_ids || [];
+  for (const childId of childIds) {
+    const child = itemMap.get(childId);
+    if (!child) {
+      continue;
+    }
+    explicitChildren.push(child);
+    explicitIds.add(child.item_id);
+  }
+  const inferredChildren = (childrenByParent.get(item.item_id) || []).filter(
+    (child) => !explicitIds.has(child.item_id),
+  );
+  return [...explicitChildren, ...inferredChildren];
+}
+
 function collectRelatedItemIds(itemIds: string[], items: RenderedItemCard[]) {
   const relatedIds = new Set<string>();
   const itemMap = new Map(items.map((item) => [item.item_id, item]));
@@ -87,6 +133,9 @@ function collectRelatedItemIds(itemIds: string[], items: RenderedItemCard[]) {
       continue;
     }
     for (const childItemId of target.market_child_item_ids || []) {
+      relatedIds.add(childItemId);
+    }
+    for (const childItemId of target.job_child_item_ids || []) {
       relatedIds.add(childItemId);
     }
   }
@@ -136,6 +185,7 @@ export default function ItemsPage() {
   const [marketLinkInput, setMarketLinkInput] = useState("");
   const [marketRefreshMessage, setMarketRefreshMessage] = useState<string | null>(null);
   const [expandedMarketIds, setExpandedMarketIds] = useState<string[]>([]);
+  const [expandedJobIds, setExpandedJobIds] = useState<string[]>([]);
   const [batchAnalysis, setBatchAnalysis] = useState<BatchAnalyzeItemsResponse | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<EditDraft | null>(null);
@@ -148,17 +198,21 @@ export default function ItemsPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const deferredQuery = useDeferredValue(query);
 
+  async function loadDashboardData() {
+    const [itemsResponse, remindersResponse] = await Promise.all([
+      apiRequest<ItemListResponse>("/items"),
+      apiRequest<ReminderListResponse>("/reminders"),
+    ]);
+    setItems(itemsResponse.data.items);
+    setReminderCount(remindersResponse.data.reminders.length);
+  }
+
   useEffect(() => {
     async function load() {
       setLoading(true);
       setError(null);
       try {
-        const [itemsResponse, remindersResponse] = await Promise.all([
-          apiRequest<ItemListResponse>("/items"),
-          apiRequest<ReminderListResponse>("/reminders"),
-        ]);
-        setItems(itemsResponse.data.items);
-        setReminderCount(remindersResponse.data.reminders.length);
+        await loadDashboardData();
       } catch (requestError) {
         setError(
           requestError instanceof Error ? requestError.message : "读取列表失败，请稍后重试。",
@@ -172,31 +226,20 @@ export default function ItemsPage() {
   }, []);
 
   useEffect(() => {
-    async function checkScheduledRefresh() {
+    async function onAutoRefresh(event: Event) {
+      const customEvent = event as CustomEvent<{ reason?: string }>;
       try {
-        const response = await apiRequest<MarketRefreshResponse>("/market/refresh", {
-          method: "POST",
-          body: JSON.stringify({ force: false }),
-        });
-        if (response.data.refreshed) {
-          const [itemsResponse, remindersResponse] = await Promise.all([
-            apiRequest<ItemListResponse>("/items"),
-            apiRequest<ReminderListResponse>("/reminders"),
-          ]);
-          setItems(itemsResponse.data.items);
-          setReminderCount(remindersResponse.data.reminders.length);
-          setMarketRefreshMessage(response.data.reason);
-        }
+        await loadDashboardData();
+        setMarketRefreshMessage(customEvent.detail?.reason || "已完成本轮市场信息刷新。");
       } catch {
         return;
       }
     }
 
-    void checkScheduledRefresh();
-    const timer = window.setInterval(() => {
-      void checkScheduledRefresh();
-    }, 15 * 60 * 1000);
-    return () => window.clearInterval(timer);
+    window.addEventListener(MARKET_REFRESH_EVENT, onAutoRefresh as EventListener);
+    return () => {
+      window.removeEventListener(MARKET_REFRESH_EVENT, onAutoRefresh as EventListener);
+    };
   }, []);
 
   useEffect(() => {
@@ -248,9 +291,31 @@ export default function ItemsPage() {
   const activityItems = useMemo(
     () =>
       filteredItems
-        .filter((item) => !isMarketItem(item))
+        .filter((item) => !isMarketItem(item) && !isJobChildItem(item))
         .sort((left, right) => getSortTimeValue(left) - getSortTimeValue(right)),
     [filteredItems],
+  );
+
+  const jobChildrenByParent = useMemo(() => {
+    const mapping = new Map<string, RenderedItemCard[]>();
+    for (const item of items) {
+      if (!isJobChildItem(item) || !item.job_parent_item_id) {
+        continue;
+      }
+      const current = mapping.get(item.job_parent_item_id) || [];
+      current.push(item);
+      mapping.set(item.job_parent_item_id, current);
+    }
+    for (const [key, value] of mapping.entries()) {
+      value.sort((left, right) => getSortTimeValue(left) - getSortTimeValue(right));
+      mapping.set(key, value);
+    }
+    return mapping;
+  }, [items]);
+
+  const itemMap = useMemo(
+    () => new Map(items.map((item) => [item.item_id, item])),
+    [items],
   );
 
   const marketItems = useMemo(
@@ -300,6 +365,9 @@ export default function ItemsPage() {
         method: "DELETE",
       });
       const hiddenChildIds = new Set(targetItem?.market_child_item_ids || []);
+      for (const childId of targetItem?.job_child_item_ids || []) {
+        hiddenChildIds.add(childId);
+      }
       hiddenChildIds.add(itemId);
       setItems((current) => current.filter((item) => !hiddenChildIds.has(item.item_id)));
       setSelectedItemIds((current) => current.filter((value) => !hiddenChildIds.has(value)));
@@ -328,6 +396,9 @@ export default function ItemsPage() {
       setItems(itemsResponse.data.items);
       setSelectedItemIds([]);
       setExpandedMarketIds((current) =>
+        current.filter((itemId) => !response.data.deleted_item_ids.includes(itemId)),
+      );
+      setExpandedJobIds((current) =>
         current.filter((itemId) => !response.data.deleted_item_ids.includes(itemId)),
       );
       if (response.data.missing_item_ids.length > 0) {
@@ -380,12 +451,7 @@ export default function ItemsPage() {
           input_link: inputLink || null,
         }),
       });
-      const [itemsResponse, remindersResponse] = await Promise.all([
-        apiRequest<ItemListResponse>("/items"),
-        apiRequest<ReminderListResponse>("/reminders"),
-      ]);
-      setItems(itemsResponse.data.items);
-      setReminderCount(remindersResponse.data.reminders.length);
+      await loadDashboardData();
       setMarketRefreshMessage(response.data.reason);
       if (inputLink) {
         setMarketLinkInput("");
@@ -650,6 +716,10 @@ export default function ItemsPage() {
           {activityItems.map((item) => {
             const [timeLabel, timeValue] = getTimeLabel(item);
             const isEditing = editingId === item.item_id && draft !== null;
+            const childCards = getOrderedChildCards(item, itemMap, jobChildrenByParent);
+            const previewCount = getJobPreviewCount(item, jobChildrenByParent);
+            const showExpandButton =
+              item.job_group_kind === "overview" || previewCount > 0;
 
             return (
               <article
@@ -677,6 +747,11 @@ export default function ItemsPage() {
                   </div>
                   <div className="metric-row">
                     <span className="tag-chip">{item.content_category}</span>
+                    {item.job_group_kind ? (
+                      <span className="tag-chip">
+                        {item.job_group_kind === "overview" ? "job_overview" : item.job_group_kind}
+                      </span>
+                    ) : null}
                     {item.priority ? (
                       <span className={`priority-badge priority-${item.priority.toLowerCase()}`}>
                         {item.priority}
@@ -707,9 +782,60 @@ export default function ItemsPage() {
                       item.source_ref || "无"
                     )}
                   </span>
+                  <span>
+                    源文件：
+                    {item.has_source_file ? (
+                      <a
+                        className="inline-link"
+                        href={getSourceFileHref(item.item_id)}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        访问源文件
+                      </a>
+                    ) : (
+                      "无"
+                    )}
+                  </span>
                   <span>来源：{item.source_type || "unknown"}</span>
                   <span>状态：{item.workflow_status}</span>
                 </div>
+                {showExpandButton ? (
+                  <div className="tag-row">
+                    <button
+                      type="button"
+                      className="segment"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setExpandedJobIds((current) =>
+                          current.includes(item.item_id)
+                            ? current.filter((value) => value !== item.item_id)
+                            : [...current, item.item_id],
+                        );
+                      }}
+                    >
+                      {expandedJobIds.includes(item.item_id)
+                        ? `收起岗位列表（${previewCount}）`
+                        : `展开岗位列表（${previewCount}）`}
+                    </button>
+                    {item.job_child_previews.map((preview) => (
+                      <button
+                        key={preview}
+                        type="button"
+                        className="tag-chip tag-chip-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setExpandedJobIds((current) =>
+                            current.includes(item.item_id) ? current : [...current, item.item_id],
+                          );
+                        }}
+                      >
+                        {preview}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
                 {item.tags.length > 0 ? (
                   <div className="tag-row">
                     {item.tags.map((tag) => (
@@ -718,6 +844,90 @@ export default function ItemsPage() {
                       </span>
                     ))}
                   </div>
+                ) : null}
+                {expandedJobIds.includes(item.item_id) ? (
+                  childCards.length > 0 ? (
+                    <div className="market-children-list">
+                      {childCards.map((child) => {
+                        const [childTimeLabel, childTimeValue] = getTimeLabel(child);
+                        return (
+                          <article
+                            key={child.item_id}
+                            className="job-card market-child-card"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void onOpenDetail(child.item_id, event);
+                            }}
+                          >
+                            <div className="card-header">
+                              <div>
+                                <p className="card-summary">{child.summary_one_line}</p>
+                                {child.insight_summary ? (
+                                  <p className="muted-text">{child.insight_summary}</p>
+                                ) : null}
+                              </div>
+                              <span className="tag-chip">role</span>
+                            </div>
+                            <div className="card-grid">
+                              <span>公司：{child.company || "待识别"}</span>
+                              <span>岗位：{child.role || "待识别"}</span>
+                              <span>地点：{getLocationLabel(child)}</span>
+                              <span>
+                                {childTimeLabel}：{formatTime(childTimeValue)}
+                              </span>
+                              <span>消息时间：{formatTime(child.message_time)}</span>
+                              <span>生成时间：{formatTime(child.generated_at)}</span>
+                              <span>
+                                原链接：
+                                {looksLikeUrl(child.source_ref) ? (
+                                  <a
+                                    className="inline-link"
+                                    href={child.source_ref || "#"}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    onClick={(event) => event.stopPropagation()}
+                                  >
+                                    {child.source_ref}
+                                  </a>
+                                ) : (
+                                  child.source_ref || "无"
+                                )}
+                              </span>
+                              <span>
+                                源文件：
+                                {child.has_source_file ? (
+                                  <a
+                                    className="inline-link"
+                                    href={getSourceFileHref(child.item_id)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    onClick={(event) => event.stopPropagation()}
+                                  >
+                                    访问源文件
+                                  </a>
+                                ) : (
+                                  "无"
+                                )}
+                              </span>
+                            </div>
+                            {child.tags.length > 0 ? (
+                              <div className="tag-row">
+                                {child.tags.map((tag) => (
+                                  <span key={tag} className="tag-chip">
+                                    {tag}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : null}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="market-children-list">
+                      <p className="muted-text">这张岗位总览卡本轮还没有生成可展示的子岗位卡。</p>
+                    </div>
+                  )
                 ) : null}
 
                 <div className="metric-row">
@@ -855,7 +1065,8 @@ export default function ItemsPage() {
         {marketRefreshMessage ? <p className="muted-text">{marketRefreshMessage}</p> : null}
         <div className="card-list">
           {marketItems.map((item) => {
-            const childCards = marketChildrenByParent.get(item.item_id) || [];
+            const childCards = getOrderedChildCards(item, itemMap, marketChildrenByParent);
+            const previewOnlyCards = item.market_child_previews.slice(childCards.length);
             const previewCount = getMarketPreviewCount(item, marketChildrenByParent);
             const showExpandButton =
               item.market_group_kind === "overview" || previewCount > 0;
@@ -917,6 +1128,22 @@ export default function ItemsPage() {
                       item.source_ref || "无"
                     )}
                   </span>
+                  <span>
+                    源文件：
+                    {item.has_source_file ? (
+                      <a
+                        className="inline-link"
+                        href={getSourceFileHref(item.item_id)}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        访问源文件
+                      </a>
+                    ) : (
+                      "无"
+                    )}
+                  </span>
                 </div>
 
                 {item.tags.length > 0 ? (
@@ -969,7 +1196,7 @@ export default function ItemsPage() {
                 ) : null}
 
                 {expandedMarketIds.includes(item.item_id) ? (
-                  childCards.length > 0 ? (
+                  childCards.length > 0 || previewOnlyCards.length > 0 ? (
                     <div className="market-children-list">
                       {childCards.map((child) => (
                         <article
@@ -1011,6 +1238,22 @@ export default function ItemsPage() {
                                 child.source_ref || "无"
                               )}
                             </span>
+                            <span>
+                              源文件：
+                              {child.has_source_file ? (
+                                <a
+                                  className="inline-link"
+                                  href={getSourceFileHref(child.item_id)}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  onClick={(event) => event.stopPropagation()}
+                                >
+                                  访问源文件
+                                </a>
+                              ) : (
+                                "无"
+                              )}
+                            </span>
                           </div>
                           {child.tags.length > 0 ? (
                             <div className="tag-row">
@@ -1022,6 +1265,26 @@ export default function ItemsPage() {
                               ))}
                             </div>
                           ) : null}
+                        </article>
+                      ))}
+                      {previewOnlyCards.map((preview) => (
+                        <article
+                          key={`${item.item_id}-${preview}`}
+                          className="job-card market-child-card"
+                        >
+                          <div className="card-header">
+                            <div>
+                              <p className="card-summary">{preview}</p>
+                              <p className="muted-text">
+                                这篇文章已经进入标题级收集，但当前还没有抓到完整正文卡片。
+                              </p>
+                            </div>
+                            <span className="tag-chip">preview_only</span>
+                          </div>
+                          <div className="card-grid">
+                            <span>状态：仅标题预览</span>
+                            <span>建议：如需全文分析，可提高“市场文章抓取上限”后再刷新。</span>
+                          </div>
                         </article>
                       ))}
                     </div>
@@ -1105,6 +1368,22 @@ export default function ItemsPage() {
                   detailItem.source_ref || detailItem.extracted_signal?.apply_url || "无"
                 )}
               </span>
+              <span>
+                源文件：
+                {detailItem.render_card?.has_source_file ? (
+                  <a
+                    className="inline-link"
+                    href={getSourceFileHref(detailItem.render_card.item_id)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {detailItem.render_card.source_file_name || "访问源文件"}
+                  </a>
+                ) : (
+                  "无"
+                )}
+              </span>
+              <span>源文件路径：{detailItem.render_card?.source_file_path || "无"}</span>
               <span>面试时间：{formatTime(detailItem.extracted_signal?.interview_time || null)}</span>
               <span>活动时间：{formatTime(detailItem.extracted_signal?.event_time || null)}</span>
             </div>

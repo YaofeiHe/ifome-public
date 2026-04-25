@@ -89,7 +89,7 @@ class JobWorkflow:
         builder.add_edge("render", END)
         return builder.compile()
 
-    def invoke(self, state: AgentState, prefer_langgraph: bool = True) -> AgentState:
+    def invoke(self, state: AgentState, prefer_langgraph: bool = False) -> AgentState:
         """Run the workflow, using LangGraph when available and requested."""
 
         if prefer_langgraph:

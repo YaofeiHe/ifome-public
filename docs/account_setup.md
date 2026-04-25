@@ -55,8 +55,10 @@
 - `ENABLE_LIVE_LLM=true`
 - `ENABLE_LIVE_RAG=true`
 - `ENABLE_OPENAI_ROUTING=false`
+- `ENABLE_QWEN_VL_OCR=true`
 - `DASHSCOPE_CHAT_MODEL=qwen-plus`
 - `DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4`
+- `QWEN_VL_OCR_MODEL=qwen-vl-ocr`
 - `QDRANT_COLLECTION=ifome_rag`
 
 ## 本地配置位置

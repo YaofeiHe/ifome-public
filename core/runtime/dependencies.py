@@ -24,12 +24,13 @@ from core.storage.sqlite_reminders import SQLiteReminderRepository
 from core.storage.sqlite_workflows import SQLiteWorkflowRepository
 from core.tools import (
     CalendarClient,
+    LocalDocumentTextExtractor,
     EmailClient,
-    LocalTesseractOCRClient,
     NoopEmbeddingGateway,
     NoopLLMGateway,
     NoopSearchClient,
     NoopVectorStore,
+    OCRClient,
     OpenAICompatibleEmbeddingGateway,
     OpenAICompatibleLLMGateway,
     PromptLoader,
@@ -37,6 +38,7 @@ from core.tools import (
     WebPageClient,
     WebSearchClient,
     WebPushClient,
+    build_ocr_client_from_settings,
 )
 
 
@@ -154,6 +156,12 @@ def build_default_search_client() -> SearchClient:
     return NoopSearchClient()
 
 
+def build_default_ocr_client() -> OCRClient:
+    """Create the OCR client from current runtime settings."""
+
+    return build_ocr_client_from_settings(AppSettings.from_env())
+
+
 def build_seed_memory_payload(user_id: str, workspace_id: str | None = None) -> dict[str, Any]:
     """Create the default memory payload used by local POC storage backends."""
 
@@ -234,7 +242,10 @@ class WorkflowDependencies:
     prompt_loader: PromptLoader = field(default_factory=PromptLoader)
     web_page_client: WebPageClient = field(default_factory=WebPageClient)
     search_client: SearchClient = field(default_factory=build_default_search_client)
-    ocr_client: LocalTesseractOCRClient = field(default_factory=LocalTesseractOCRClient)
+    ocr_client: OCRClient = field(default_factory=build_default_ocr_client)
+    document_text_extractor: LocalDocumentTextExtractor = field(
+        default_factory=LocalDocumentTextExtractor
+    )
     email_client: EmailClient = field(default_factory=EmailClient)
     calendar_client: CalendarClient = field(default_factory=CalendarClient)
     web_push_client: WebPushClient = field(default_factory=WebPushClient)
