@@ -175,6 +175,7 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 - 会先做 Query Rewrite、多路检索扩词和 Prompt 拼装
 - 上传简历或项目说明时会先总结文件主要内容，再把结果写入画像
 - 可切换到“模拟 Boss 回复”模式，把对方消息渲染成对话框并一键复制建议回复
+- Boss 回复模拟会缓存最近多轮对话，上下文会自动带入下一轮生成；建议回复和回复策略会分开展示，复制按钮只复制回复正文
 
 ## 当前主要页面
 

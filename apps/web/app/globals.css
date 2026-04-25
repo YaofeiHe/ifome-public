@@ -257,6 +257,24 @@ h2 {
   gap: 14px;
 }
 
+.chat-simulator-thread {
+  display: grid;
+  gap: 18px;
+}
+
+.chat-turn {
+  display: grid;
+  gap: 10px;
+}
+
+.chat-simulator-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
 .chat-bubble {
   padding: 18px 20px;
   border-radius: 22px;
@@ -287,6 +305,20 @@ h2 {
   gap: 12px;
   align-items: center;
   margin-bottom: 10px;
+}
+
+.chat-strategy-box {
+  justify-self: end;
+  max-width: min(700px, 84%);
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px dashed rgba(116, 49, 18, 0.22);
+  background: rgba(255, 250, 242, 0.84);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+
+.chat-strategy-box p {
+  margin: 0;
 }
 
 .field {

@@ -19,18 +19,71 @@ type AttachedFile = {
 
 type ChatMode = "grounded_chat" | "boss_simulator";
 
-function buildBossSimulatorPrompt(query: string) {
+type BossConversationTurn = {
+  id: string;
+  bossMessage: string;
+  replyText: string;
+  strategy: string;
+};
+
+const BOSS_SIMULATOR_CACHE_KEY = "ifome:boss-simulator-history:v2";
+
+function parseBossAnswer(answer: string) {
+  const normalized = answer.trim();
+  const strategyPattern = /(?:^|\n)(?:回复策略|策略说明|回复思路)\s*[：:]\s*/;
+  const matched = normalized.match(strategyPattern);
+  if (!matched || matched.index === undefined) {
+    return {
+      replyText: normalized,
+      strategy: "这轮没有显式输出回复策略，建议结合语气和上下文再做一次人工确认。",
+    };
+  }
+
+  const replyText = normalized.slice(0, matched.index).trim();
+  const strategy = normalized
+    .slice(matched.index + matched[0].length)
+    .trim();
+
+  return {
+    replyText: replyText || normalized,
+    strategy: strategy || "这轮没有显式输出回复策略，建议结合语气和上下文再做一次人工确认。",
+  };
+}
+
+function buildBossSimulatorPrompt(
+  currentMessage: string,
+  history: BossConversationTurn[],
+) {
+  const transcript = history.length
+    ? history
+        .slice(-12)
+        .map(
+          (turn, index) =>
+            [
+              `第 ${index + 1} 轮对话`,
+              `Boss / HR：${turn.bossMessage}`,
+              `我上一轮发送的回复：${turn.replyText}`,
+            ].join("\n"),
+        )
+        .join("\n\n")
+    : "暂无历史对话。";
+
   return [
-    "请基于我的长期画像、项目画像、简历、已有岗位卡片和附件内容，模拟求职场景中的 Boss / HR 沟通回复。",
+    "请基于我的长期画像、项目画像、简历、已有岗位卡片、附件内容和下面的历史对话，模拟求职场景中的 Boss / HR 沟通回复。",
     "任务要求：",
-    "1. 先理解对方消息的真实意图和上下文。",
-    "2. 输出一条我可以直接发送的中文回复，语气自然、礼貌、具体，不要太模板化。",
-    "3. 再补一小段“回复策略：...”说明你为什么这么回。",
-    "4. 如果我上传了附件，把附件视为对方消息、JD、聊天截图或上下文材料一起理解。",
-    "5. 如果信息不足，先基于已有信息给出一个稳妥版本，不要拒答。",
+    "1. 先理解当前这条消息和前文关系，不要把每一轮都当成全新陌生对话。",
+    "2. 只输出两部分：",
+    "第一部分用“建议回复：”开头，写一条我可以直接发送的中文回复正文。",
+    "第二部分用“回复策略：”开头，简要说明为什么这么回。",
+    "3. 建议回复要自然、礼貌、具体，不要太模板化。",
+    "4. 如果我上传了附件，把附件视为聊天截图、JD、简历或上下文材料一起理解。",
+    "5. 如果信息不足，也先基于已有上下文给一个稳妥版本，不要拒答。",
     "",
-    "对方消息：",
-    query,
+    "历史对话：",
+    transcript,
+    "",
+    "当前收到的新消息：",
+    currentMessage,
   ].join("\n");
 }
 
@@ -61,8 +114,8 @@ export default function ChatPage() {
   const [queryPlan, setQueryPlan] = useState<ChatQueryResponse["query_plan"]>(null);
   const [memoryUpdate, setMemoryUpdate] = useState<ChatQueryResponse["memory_update"]>(null);
   const [attachments, setAttachments] = useState<ChatQueryResponse["attachments"]>([]);
-  const [lastBossMessage, setLastBossMessage] = useState<string | null>(null);
-  const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const [bossHistory, setBossHistory] = useState<BossConversationTurn[]>([]);
+  const [copiedTurnId, setCopiedTurnId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -80,6 +133,40 @@ export default function ChatPage() {
 
     void loadItems();
   }, []);
+
+  useEffect(() => {
+    try {
+      const cached = window.localStorage.getItem(BOSS_SIMULATOR_CACHE_KEY);
+      if (!cached) {
+        return;
+      }
+      const parsed = JSON.parse(cached) as BossConversationTurn[];
+      if (!Array.isArray(parsed)) {
+        return;
+      }
+      setBossHistory(
+        parsed.filter(
+          (turn) =>
+            Boolean(turn?.id) &&
+            Boolean(turn?.bossMessage) &&
+            Boolean(turn?.replyText),
+        ),
+      );
+    } catch {
+      return;
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        BOSS_SIMULATOR_CACHE_KEY,
+        JSON.stringify(bossHistory),
+      );
+    } catch {
+      return;
+    }
+  }, [bossHistory]);
 
   function appendFiles(nextFiles: FileList | File[] | null) {
     if (!nextFiles || nextFiles.length === 0) {
@@ -109,15 +196,22 @@ export default function ChatPage() {
     setAttachedFiles((current) => current.filter((item) => item.id !== targetId));
   }
 
-  async function copyReply() {
-    if (!answer) {
-      return;
-    }
+  async function copyReply(replyText: string, turnId: string) {
     try {
-      await navigator.clipboard.writeText(answer);
-      setCopyMessage("回复已复制。");
+      await navigator.clipboard.writeText(replyText);
+      setCopiedTurnId(turnId);
     } catch {
-      setCopyMessage("复制失败，请稍后再试。");
+      setCopiedTurnId(null);
+    }
+  }
+
+  function clearBossHistory() {
+    setBossHistory([]);
+    setCopiedTurnId(null);
+    try {
+      window.localStorage.removeItem(BOSS_SIMULATOR_CACHE_KEY);
+    } catch {
+      return;
     }
   }
 
@@ -125,11 +219,13 @@ export default function ChatPage() {
     event.preventDefault();
     setPending(true);
     setError(null);
-    setCopyMessage(null);
+    setCopiedTurnId(null);
 
     const visibleBossMessage = buildVisibleBossMessage(query, attachedFiles);
     const submittedQuery =
-      mode === "boss_simulator" ? buildBossSimulatorPrompt(query) : query;
+      mode === "boss_simulator"
+        ? buildBossSimulatorPrompt(visibleBossMessage, bossHistory)
+        : query;
 
     try {
       const formData = new FormData();
@@ -155,8 +251,20 @@ export default function ChatPage() {
         setQueryPlan(response.data.query_plan ?? null);
         setMemoryUpdate(response.data.memory_update ?? null);
         setAttachments(response.data.attachments ?? []);
+        if (mode === "boss_simulator") {
+          const parsedAnswer = parseBossAnswer(response.data.answer);
+          setBossHistory((current) => [
+            ...current,
+            {
+              id: `boss-turn-${Date.now()}`,
+              bossMessage: visibleBossMessage,
+              replyText: parsedAnswer.replyText,
+              strategy: parsedAnswer.strategy,
+            },
+          ]);
+        }
         setAttachedFiles([]);
-        setLastBossMessage(mode === "boss_simulator" ? visibleBossMessage : null);
+        setQuery("");
       });
     } catch (requestError) {
       setError(
@@ -214,6 +322,17 @@ export default function ChatPage() {
               模拟 Boss 回复
             </button>
           </div>
+
+          {mode === "boss_simulator" ? (
+            <div className="chat-simulator-toolbar">
+              <p className="muted-text">
+                历史对话会缓存在当前浏览器里，下一轮生成时会自动参考最近几轮上下文。
+              </p>
+              <button type="button" className="segment" onClick={clearBossHistory}>
+                清空历史对话
+              </button>
+            </div>
+          ) : null}
 
           <label className="field">
             <span>限定条目</span>
@@ -310,33 +429,51 @@ export default function ChatPage() {
       <section className="panel">
         <h2>{mode === "boss_simulator" ? "回复建议" : "回答"}</h2>
         {error ? <p className="error-text">{error}</p> : null}
-        {!answer ? (
+        {!answer && mode !== "boss_simulator" ? (
           <p className="muted-text">
             提交后，这里会展示回答、检索模式、预处理意图、附件转文本结果和画像更新摘要。
           </p>
-        ) : (
-          <div className="result-stack">
-            {mode === "boss_simulator" && lastBossMessage ? (
-              <div className="chat-simulator">
-                <article className="chat-bubble chat-bubble-boss">
-                  <p className="workspace-kicker">Boss / HR</p>
-                  <p>{lastBossMessage}</p>
-                </article>
-                <article className="chat-bubble chat-bubble-agent">
-                  <div className="chat-bubble-header">
-                    <p className="workspace-kicker">建议回复</p>
-                    <button type="button" className="segment" onClick={() => void copyReply()}>
-                      一键复制回复
-                    </button>
-                  </div>
-                  <p>{answer}</p>
-                </article>
-                {copyMessage ? <p className="muted-text">{copyMessage}</p> : null}
-              </div>
-            ) : (
-              <p className="answer-box">{answer}</p>
-            )}
+        ) : null}
 
+        {mode === "boss_simulator" ? (
+          <div className="result-stack">
+            {bossHistory.length === 0 ? (
+              <p className="muted-text">
+                这里会按社交聊天框形式展示多轮对话。每轮都会单独给出“建议回复”气泡和“回复策略”。
+              </p>
+            ) : (
+              <div className="chat-simulator-thread">
+                {bossHistory.map((turn) => (
+                  <div key={turn.id} className="chat-turn">
+                    <article className="chat-bubble chat-bubble-boss">
+                      <p className="workspace-kicker">Boss / HR</p>
+                      <p>{turn.bossMessage}</p>
+                    </article>
+                    <article className="chat-bubble chat-bubble-agent">
+                      <div className="chat-bubble-header">
+                        <p className="workspace-kicker">建议回复</p>
+                        <button
+                          type="button"
+                          className="segment"
+                          onClick={() => void copyReply(turn.replyText, turn.id)}
+                        >
+                          {copiedTurnId === turn.id ? "已复制" : "复制回复"}
+                        </button>
+                      </div>
+                      <p>{turn.replyText}</p>
+                    </article>
+                    <div className="chat-strategy-box">
+                      <p className="workspace-kicker">回复策略</p>
+                      <p>{turn.strategy}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : answer ? (
+          <div className="result-stack">
+            <p className="answer-box">{answer}</p>
             {retrievalMode ? <p className="muted-text">检索模式：{retrievalMode}</p> : null}
 
             {queryPlan ? (
@@ -440,7 +577,7 @@ export default function ChatPage() {
               </div>
             ) : null}
           </div>
-        )}
+        ) : null}
       </section>
     </main>
   );
