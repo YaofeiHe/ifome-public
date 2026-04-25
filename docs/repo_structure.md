@@ -68,8 +68,8 @@
 - `apps/web/app/items/page.tsx`：卡片列表页，支持编辑、删除、批量删除和详情查看。
 - `apps/web/app/items/page.tsx`：卡片列表页，支持点击切换 `求职活动 / 市场信息`、编辑、删除、批量删除、详情查看、市场总览卡片下“展开文章列表（N）”按钮触发的小卡片列表展开，也支持求职活动里的多岗位 overview 卡下“展开岗位列表（N）”查看子岗位卡片，以及收敛后的单一市场刷新按钮与市场信息区直接显示批量删除入口。
 - `apps/web/app/items/page.tsx`：同时负责把列表里的所有时间统一格式化成 `年月日 + 时分秒` 的前端显示格式。
-- `apps/web/app/memory/page.tsx`：记忆管理页，市场监控源通过可滚动表格维护，并且可以直接配置每个来源单次刷新时的市场文章抓取上限。
-- `apps/web/app/chat/page.tsx`：聊天控制台页，支持按时间窗口做近期卡片检索。
+- `apps/web/app/memory/page.tsx`：记忆管理页，市场监控源通过可滚动表格维护，并且可以直接配置每个来源单次刷新时的市场文章抓取上限；简历原文和最近回写结果会作为可展开小卡片显示。
+- `apps/web/app/chat/page.tsx`：聊天控制台页，支持按时间窗口做近期卡片检索、用已归档简历更新项目画像，以及把 Boss / HR 模拟回复保存成可展开的历史列表并按单轮评价重生成。
 - `apps/web/app/lib/api.ts`：前端请求后端的统一封装。
 - `apps/web/__init__.py`：让前端源码可以随安装包一起分发，供统一启动器在非源码场景下准备运行目录。
 - `scripts/market_watch_recent_titles.py`：本地命令行脚本，用来单独测试某个站点是否能直接抓出近 24 小时标题列表。
@@ -84,13 +84,19 @@
 职责：
 
 - 定义主工作流有哪些节点
-- 维护节点顺序和 LangGraph 编排方式
-- 提供没有 LangGraph 时的顺序执行回退
+- 维护手写顺序执行框架
+- 保留历史 LangGraph 兼容层，方便迁移期比对与回归
 
 关键文件：
 
-- `core/graph/workflow.py`：工作流入口，支持 `run_sequential()` 和 `build_langgraph()`。
+- `core/graph/workflow.py`：工作流入口，默认执行 `run_sequential()`，`build_langgraph()` 只作为兼容残留保留。
 - `core/graph/nodes/*.py`：每个独立节点的实现。
+
+现在面试时更准确的讲法是：
+
+- 核心执行路径已经切到自己手写的顺序 runtime
+- Prompt 拼装、Query Rewrite、检索编排、节点调度都在项目内部实现
+- LangGraph 相关代码目前只剩兼容层和历史迁移痕迹，不再是线上默认核心
 
 最近值得点名的节点变化：
 

@@ -434,6 +434,42 @@ class ChatQueryResponse(BaseModel):
     )
 
 
+class ChatSessionTurn(BaseModel):
+    """One turn snapshot used for client-side conversation summarization."""
+
+    mode: str = Field(default="grounded_chat")
+    user_message: str = Field(description="User or Boss message shown in the thread.")
+    answer: str = Field(description="Assistant answer or suggested reply.")
+    strategy: str | None = Field(
+        default=None,
+        description="Optional strategy notes for Boss reply simulation turns.",
+    )
+
+
+class ChatSessionSummaryRequest(BaseModel):
+    """Request body for compressing one stored chat conversation."""
+
+    mode: str = Field(default="grounded_chat")
+    turns: list[ChatSessionTurn] = Field(default_factory=list)
+    conversation_title: str | None = Field(default=None)
+
+
+class ChatSessionSummaryResponse(BaseModel):
+    """Compressed metadata used to render archived chat conversations."""
+
+    title: str = Field(description="Short archived conversation title.")
+    summary: str = Field(description="Compact archived conversation summary.")
+    keywords: list[str] = Field(default_factory=list)
+    compressed_transcript: str = Field(
+        default="",
+        description="Compressed conversation context used for lightweight reload.",
+    )
+    summary_source: str = Field(
+        default="heuristic",
+        description="Whether the summary came from local fallback or live LLM compression.",
+    )
+
+
 class ProjectSelfMemoryWriteRequest(BaseModel):
     """Request body for the experimental project-self-memory API."""
 

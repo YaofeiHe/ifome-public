@@ -333,6 +333,17 @@ class ChatExecutionResult:
 
 
 @dataclass(frozen=True)
+class ChatSessionSummaryResult:
+    """Compressed metadata for archived chat conversations."""
+
+    title: str
+    summary: str
+    keywords: list[str] = field(default_factory=list)
+    compressed_transcript: str = ""
+    summary_source: str = "heuristic"
+
+
+@dataclass(frozen=True)
 class MarketArticleCandidate:
     """One title-level market article candidate before or after正文抓取."""
 
@@ -2222,6 +2233,7 @@ for path in renderedPaths {
         for state in states:
             if state.render_card is None and state.normalized_item is not None:
                 state.render_card = self._build_fallback_card(state)
+        self._repair_market_cards(states)
         return states
 
     def get_item(self, item_id: str) -> AgentState | None:
@@ -2230,7 +2242,82 @@ for path in renderedPaths {
         state = self.dependencies.workflow_repository.get(item_id)
         if state is not None and state.render_card is None and state.normalized_item is not None:
             state.render_card = self._build_fallback_card(state)
+        if state is not None:
+            sibling_states = self.dependencies.workflow_repository.list_all(
+                user_id=state.user_id,
+                workspace_id=state.workspace_id,
+            )
+            for sibling in sibling_states:
+                if sibling.render_card is None and sibling.normalized_item is not None:
+                    sibling.render_card = self._build_fallback_card(sibling)
+            self._repair_market_cards(sibling_states)
         return state
+
+    def _repair_market_cards(self, states: list[AgentState]) -> None:
+        """Backfill visible market titles and preview lists for older stored cards."""
+
+        article_titles_by_parent: dict[str, list[str]] = {}
+        for state in states:
+            if state.normalized_item is None or state.render_card is None:
+                continue
+            group_kind = str(state.source_metadata.get("market_group_kind") or "")
+            if group_kind != "article":
+                continue
+
+            normalized_title = str(state.normalized_item.source_title or "").strip()
+            desired_title = str(
+                state.source_metadata.get("market_article_title") or normalized_title
+            ).strip()
+            changed = False
+            if desired_title and state.render_card.summary_one_line != desired_title:
+                state.render_card.summary_one_line = desired_title
+                changed = True
+            if desired_title and state.extracted_signal is not None:
+                if state.extracted_signal.summary_one_line != desired_title:
+                    state.extracted_signal.summary_one_line = desired_title
+                    changed = True
+            parent_id = str(state.source_metadata.get("market_parent_item_id") or "").strip()
+            if parent_id and desired_title:
+                article_titles_by_parent.setdefault(parent_id, []).append(desired_title)
+            if changed:
+                self.dependencies.workflow_repository.save(state)
+
+        for state in states:
+            if state.normalized_item is None or state.render_card is None:
+                continue
+            group_kind = str(state.source_metadata.get("market_group_kind") or "")
+            if group_kind != "overview":
+                continue
+
+            ordered_titles: list[str] = []
+            child_ids = list(state.render_card.market_child_item_ids or [])
+            for child_id in child_ids:
+                child_state = next(
+                    (
+                        candidate
+                        for candidate in states
+                        if candidate.normalized_item is not None
+                        and candidate.normalized_item.id == child_id
+                        and candidate.render_card is not None
+                    ),
+                    None,
+                )
+                if child_state is None or not child_state.render_card.summary_one_line:
+                    continue
+                ordered_titles.append(child_state.render_card.summary_one_line)
+            if not ordered_titles:
+                ordered_titles = article_titles_by_parent.get(state.normalized_item.id, [])
+
+            preview_limit = max(
+                len(state.render_card.market_child_previews),
+                len(state.source_metadata.get("market_child_previews", [])),
+                min(len(ordered_titles), MARKET_ARTICLE_FETCH_LIMIT),
+            )
+            desired_previews = ordered_titles[:preview_limit]
+            if desired_previews and state.render_card.market_child_previews != desired_previews:
+                state.render_card.market_child_previews = desired_previews
+                state.source_metadata["market_child_previews"] = desired_previews
+                self.dependencies.workflow_repository.save(state)
 
     def get_source_file(self, item_id: str) -> tuple[Path, str] | None:
         """Return one archived source file path and file name for the given item."""
@@ -3314,6 +3401,174 @@ for path in renderedPaths {
             attachments=all_attachment_results,
         )
 
+    def summarize_chat_session(
+        self,
+        *,
+        mode: str,
+        turns: list[dict[str, Any]],
+        conversation_title: str | None = None,
+    ) -> ChatSessionSummaryResult:
+        """Compress one archived conversation using keyword extraction + hierarchical summary."""
+
+        cleaned_turns = [
+            {
+                "mode": str(turn.get("mode") or mode or "grounded_chat"),
+                "user_message": str(turn.get("user_message") or "").strip(),
+                "answer": str(turn.get("answer") or "").strip(),
+                "strategy": str(turn.get("strategy") or "").strip(),
+            }
+            for turn in turns
+            if str(turn.get("user_message") or "").strip() or str(turn.get("answer") or "").strip()
+        ]
+        if not cleaned_turns:
+            return ChatSessionSummaryResult(
+                title=conversation_title or "空白对话",
+                summary="这段对话还没有有效内容。",
+                keywords=[],
+                compressed_transcript="暂无历史对话。",
+                summary_source="heuristic",
+            )
+
+        keywords = self._extract_chat_session_keywords(cleaned_turns)
+        compressed_transcript = self._compress_chat_session_turns(cleaned_turns)
+        fallback = self._build_chat_session_summary_fallback(
+            mode=mode,
+            turns=cleaned_turns,
+            keywords=keywords,
+            compressed_transcript=compressed_transcript,
+            conversation_title=conversation_title,
+        )
+
+        route = self.dependencies.model_router.select("chat", "medium")
+        if self.dependencies.llm_gateway.is_available(route):
+            try:
+                prompt = self.dependencies.prompt_loader.load("chat_session_summary")
+                response = self.dependencies.llm_gateway.complete_json(
+                    route=route,
+                    task_name="chat_session_summary",
+                    system_prompt=prompt,
+                    user_payload={
+                        "mode": mode,
+                        "conversation_title": conversation_title,
+                        "keywords": keywords,
+                        "compressed_transcript": compressed_transcript,
+                        "fallback": {
+                            "title": fallback.title,
+                            "summary": fallback.summary,
+                            "keywords": fallback.keywords,
+                        },
+                    },
+                )
+                title = str(response.get("title") or "").strip() or fallback.title
+                summary = str(response.get("summary") or "").strip() or fallback.summary
+                llm_keywords = [
+                    str(value).strip()
+                    for value in response.get("keywords", [])
+                    if str(value).strip()
+                ]
+                return ChatSessionSummaryResult(
+                    title=title[:60],
+                    summary=summary[:240],
+                    keywords=list(dict.fromkeys([*llm_keywords, *keywords]))[:8],
+                    compressed_transcript=compressed_transcript,
+                    summary_source="llm",
+                )
+            except (LLMGatewayError, FileNotFoundError, KeyError, TypeError, ValueError):
+                pass
+
+        return fallback
+
+    def _extract_chat_session_keywords(self, turns: list[dict[str, str]]) -> list[str]:
+        """Extract reusable keywords from archived chat turns before summarization."""
+
+        combined = "\n".join(
+            "\n".join(
+                [
+                    str(turn.get("user_message") or ""),
+                    str(turn.get("answer") or ""),
+                    str(turn.get("strategy") or ""),
+                ]
+            )
+            for turn in turns
+        )
+        keywords: list[str] = []
+        keywords.extend(self._extract_role_candidates(combined))
+        keywords.extend(self._extract_skill_candidates(combined))
+        keywords.extend(self._extract_company_candidates(combined))
+        keywords.extend(self._extract_keyword_candidates(combined))
+        return list(dict.fromkeys(keyword for keyword in keywords if len(keyword.strip()) >= 2))[:8]
+
+    def _compress_chat_session_turns(self, turns: list[dict[str, str]]) -> str:
+        """Keep recent turns verbatim while compressing older ones into a lightweight memo."""
+
+        recent_window = turns[-4:]
+        older_turns = turns[:-4]
+        lines: list[str] = []
+
+        if older_turns:
+            lines.append("中期摘要：")
+            for index, turn in enumerate(older_turns[-8:], start=max(len(older_turns) - 7, 1)):
+                user_message = str(turn.get("user_message") or "").replace("\n", " ").strip()
+                answer = str(turn.get("answer") or "").replace("\n", " ").strip()
+                strategy = str(turn.get("strategy") or "").replace("\n", " ").strip()
+                parts = [f"第 {index} 轮"]
+                if user_message:
+                    parts.append(f"输入：{user_message[:80]}")
+                if answer:
+                    parts.append(f"输出：{answer[:90]}")
+                if strategy:
+                    parts.append(f"策略：{strategy[:60]}")
+                lines.append(" | ".join(parts))
+
+        lines.append("最近窗口：")
+        for index, turn in enumerate(recent_window, start=max(len(turns) - len(recent_window) + 1, 1)):
+            user_message = str(turn.get("user_message") or "").strip()
+            answer = str(turn.get("answer") or "").strip()
+            strategy = str(turn.get("strategy") or "").strip()
+            lines.append(f"第 {index} 轮输入：{user_message[:220]}")
+            if answer:
+                lines.append(f"第 {index} 轮输出：{answer[:260]}")
+            if strategy:
+                lines.append(f"第 {index} 轮策略：{strategy[:160]}")
+        return "\n".join(lines)[:3200]
+
+    def _build_chat_session_summary_fallback(
+        self,
+        *,
+        mode: str,
+        turns: list[dict[str, str]],
+        keywords: list[str],
+        compressed_transcript: str,
+        conversation_title: str | None,
+    ) -> ChatSessionSummaryResult:
+        """Build one deterministic archived-conversation summary when live LLM is unavailable."""
+
+        latest_turn = turns[-1]
+        latest_user_message = str(latest_turn.get("user_message") or "").strip()
+        latest_answer = str(latest_turn.get("answer") or "").strip()
+        title = (
+            str(conversation_title or "").strip()
+            or " / ".join(keywords[:2]).strip()
+            or latest_user_message[:24]
+            or "聊天对话"
+        )
+        mode_label = "Boss 模拟" if mode == "boss_simulator" else "聊天问答"
+        summary_bits = [
+            f"{mode_label}共 {len(turns)} 轮",
+            f"最近在处理：{latest_user_message[:50] or '未记录问题'}",
+        ]
+        if latest_answer:
+            summary_bits.append(f"最新输出：{latest_answer[:70]}")
+        if keywords:
+            summary_bits.append(f"关键词：{'、'.join(keywords[:4])}")
+        return ChatSessionSummaryResult(
+            title=title[:60],
+            summary="；".join(summary_bits)[:240],
+            keywords=keywords[:8],
+            compressed_transcript=compressed_transcript,
+            summary_source="heuristic",
+        )
+
     def _expand_chat_query_analysis(
         self,
         *,
@@ -3841,6 +4096,36 @@ for path in renderedPaths {
             notes.extend(profile_notes)
             notes.extend(career_notes)
 
+        if apply_memory_updates and self._should_refresh_projects_from_resume(
+            query=query,
+            query_analysis=query_analysis,
+            profile=updated_profile,
+        ):
+            refreshed_projects = self._extract_projects_from_resume_snapshot(
+                updated_profile.resume_snapshot
+            )
+            if refreshed_projects:
+                merged_projects = list(updated_profile.projects)
+                for project_entry in refreshed_projects:
+                    merged_projects, _ = self._merge_project_entries(
+                        current_projects=merged_projects,
+                        new_entry=project_entry,
+                    )
+                updated_profile = updated_profile.model_copy(
+                    update={
+                        "projects": merged_projects,
+                        "updated_at": now_in_project_timezone(),
+                    }
+                )
+                if "projects" not in profile_fields:
+                    profile_fields.append("projects")
+                resume_label = (
+                    updated_profile.resume_snapshot.source_file_name
+                    if updated_profile.resume_snapshot is not None
+                    else "当前简历"
+                )
+                notes.append(f"已基于 {resume_label} 更新项目画像卡片。")
+
         applied = bool(profile_fields or career_fields)
         return (
             updated_profile,
@@ -3886,6 +4171,178 @@ for path in renderedPaths {
         if not lines:
             return "未提取到项目说明正文。"
         return " / ".join(lines[:4])[:260]
+
+    def _should_refresh_projects_from_resume(
+        self,
+        *,
+        query: str,
+        query_analysis: QueryAnalysis,
+        profile: ProfileMemory,
+    ) -> bool:
+        """Detect explicit requests to rebuild project cards from the saved resume snapshot."""
+
+        if profile.resume_snapshot is None:
+            return False
+        normalized = re.sub(r"\s+", "", query.lower())
+        explicit_markers = (
+            "用简历更新项目画像",
+            "根据简历更新项目画像",
+            "用简历生成项目画像",
+            "根据简历生成项目画像",
+            "从简历更新项目画像",
+            "从简历生成项目画像",
+            "用简历更新项目卡片",
+            "根据简历更新项目卡片",
+            "根据简历整理项目经历",
+        )
+        if any(marker in normalized for marker in explicit_markers):
+            return True
+        return bool(
+            "projects" in query_analysis.profile_update_hints
+            and "简历" in query
+            and any(keyword in query for keyword in ("项目画像", "项目卡片", "项目经历"))
+            and any(keyword in query for keyword in ("更新", "整理", "生成", "同步"))
+        )
+
+    def _extract_projects_from_resume_snapshot(
+        self,
+        resume_snapshot: ResumeSnapshot | None,
+    ) -> list[ProjectMemoryEntry]:
+        """Build project memory entries from the current saved resume snapshot."""
+
+        if resume_snapshot is None:
+            return []
+
+        route = self.dependencies.model_router.select("chat", "medium")
+        if self.dependencies.llm_gateway.is_available(route):
+            try:
+                prompt = self.dependencies.prompt_loader.load("resume_projects_to_memory")
+                response = self.dependencies.llm_gateway.complete_json(
+                    route=route,
+                    task_name="resume_projects_to_memory",
+                    system_prompt=prompt,
+                    user_payload={
+                        "file_name": resume_snapshot.file_name or "resume",
+                        "text": resume_snapshot.text[:14000],
+                    },
+                )
+                projects: list[ProjectMemoryEntry] = []
+                for item in response.get("projects", []):
+                    name = str(item.get("name") or "").strip()
+                    summary = str(item.get("summary") or "").strip()
+                    if not name or not summary:
+                        continue
+                    projects.append(
+                        ProjectMemoryEntry(
+                            name=name[:80],
+                            summary=summary[:280],
+                            role=str(item.get("role") or "").strip() or None,
+                            tech_stack=[
+                                str(value).strip()
+                                for value in item.get("tech_stack", [])
+                                if str(value).strip()
+                            ][:12],
+                            highlight_points=[
+                                str(value).strip()
+                                for value in item.get("highlight_points", [])
+                                if str(value).strip()
+                            ][:8],
+                            interview_story_hooks=[
+                                str(value).strip()
+                                for value in item.get("interview_story_hooks", [])
+                                if str(value).strip()
+                            ][:6],
+                            source_file_name=resume_snapshot.source_file_name,
+                            source_file_path=resume_snapshot.source_file_path,
+                        )
+                    )
+                if projects:
+                    return projects
+            except (LLMGatewayError, FileNotFoundError, KeyError, TypeError, ValueError):
+                pass
+
+        return self._heuristic_extract_projects_from_resume_snapshot(resume_snapshot)
+
+    def _heuristic_extract_projects_from_resume_snapshot(
+        self,
+        resume_snapshot: ResumeSnapshot,
+    ) -> list[ProjectMemoryEntry]:
+        """Fallback extraction of project cards from resume text without a live LLM."""
+
+        lines = [line.strip() for line in resume_snapshot.text.splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        start_index = next(
+            (index for index, line in enumerate(lines) if "项目经历" in line or "项目经验" in line),
+            None,
+        )
+        if start_index is None:
+            return []
+
+        section_lines: list[str] = []
+        for line in lines[start_index + 1 :]:
+            compact = line.replace(" ", "")
+            if compact in {"教育经历", "工作经历", "实习经历", "校园经历", "技能", "专业技能", "自我评价"}:
+                break
+            section_lines.append(line)
+
+        if not section_lines:
+            return []
+
+        chunks: list[list[str]] = []
+        current_chunk: list[str] = []
+        for line in section_lines:
+            normalized = line.strip("：: ")
+            is_candidate_title = (
+                2 <= len(normalized) <= 36
+                and not URL_PATTERN.search(normalized)
+                and any(char not in "0123456789.-/" for char in normalized)
+                and any(keyword in normalized for keyword in ("项目", "系统", "平台", "助手", "工具", "引擎"))
+            )
+            if is_candidate_title and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = [line]
+                continue
+            current_chunk.append(line)
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        projects: list[ProjectMemoryEntry] = []
+        for chunk in chunks[:6]:
+            if not chunk:
+                continue
+            title = chunk[0].strip("：: ")
+            body = "\n".join(chunk[1:] or chunk[:3])
+            summary = self._build_project_summary(body or "\n".join(chunk))
+            tech_stack = [
+                skill
+                for skill in KNOWN_SKILL_TERMS
+                if skill.lower() in (body or "\n".join(chunk)).lower()
+            ][:12]
+            highlights = [
+                line
+                for line in chunk[1:]
+                if any(
+                    marker in line
+                    for marker in ("负责", "设计", "实现", "优化", "提升", "落地", "指标", "%", "效果")
+                )
+            ][:6]
+            if not highlights:
+                highlights = chunk[1:4] or chunk[:3]
+            projects.append(
+                ProjectMemoryEntry(
+                    name=title[:80],
+                    summary=summary,
+                    role=None,
+                    tech_stack=tech_stack,
+                    highlight_points=highlights,
+                    interview_story_hooks=highlights[:3],
+                    source_file_name=resume_snapshot.source_file_name,
+                    source_file_path=resume_snapshot.source_file_path,
+                )
+            )
+        return projects
 
     def _structure_project_snapshot(
         self,
@@ -5739,7 +6196,8 @@ for path in renderedPaths {
                 profile_memory=profile_memory,
                 career_state_memory=career_state_memory,
             )
-            card.summary_one_line = summary
+            article_title = str(state.source_metadata.get("market_article_title") or "").strip()
+            card.summary_one_line = article_title or summary
         card.insight_summary = summary
         card.advice = advice
         card.tags = tags

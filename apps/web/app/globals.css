@@ -252,6 +252,51 @@ h2 {
   align-items: center;
 }
 
+.conversation-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 18px;
+}
+
+.conversation-list {
+  display: grid;
+  gap: 14px;
+}
+
+.conversation-card {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(78, 56, 18, 0.12);
+  background: rgba(255, 252, 246, 0.88);
+}
+
+.conversation-card-active {
+  border-color: rgba(165, 74, 27, 0.34);
+  box-shadow: 0 16px 28px rgba(121, 72, 24, 0.08);
+}
+
+.conversation-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.conversation-summary-box {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px dashed rgba(116, 49, 18, 0.16);
+  background: rgba(255, 249, 238, 0.84);
+}
+
 .chat-simulator {
   display: grid;
   gap: 14px;
@@ -260,6 +305,34 @@ h2 {
 .chat-simulator-thread {
   display: grid;
   gap: 18px;
+}
+
+.chat-history-list {
+  display: grid;
+  gap: 14px;
+}
+
+.chat-history-card {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(78, 56, 18, 0.12);
+  background: rgba(255, 252, 246, 0.88);
+}
+
+.chat-history-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.chat-history-toggle {
+  text-align: left;
+  justify-content: flex-start;
+  max-width: 100%;
 }
 
 .chat-turn {
@@ -319,6 +392,25 @@ h2 {
 
 .chat-strategy-box p {
   margin: 0;
+}
+
+.chat-feedback-box {
+  justify-self: end;
+  width: min(760px, 92%);
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(116, 49, 18, 0.16);
+  background: rgba(255, 249, 238, 0.94);
+}
+
+.chat-feedback-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
 }
 
 .field {

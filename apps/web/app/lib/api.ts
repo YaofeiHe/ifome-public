@@ -234,6 +234,21 @@ export type ChatQueryResponse = {
   }[];
 };
 
+export type ChatSessionSummaryTurn = {
+  mode: string;
+  user_message: string;
+  answer: string;
+  strategy?: string | null;
+};
+
+export type ChatSessionSummaryResponse = {
+  title: string;
+  summary: string;
+  keywords: string[];
+  compressed_transcript: string;
+  summary_source: string;
+};
+
 export type ItemDetailResponse = {
   item: {
     trace_id: string;

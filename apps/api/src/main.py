@@ -23,6 +23,8 @@ from apps.api.src.contracts import (
     ChatQueryPlan,
     ChatQueryRequest,
     ChatQueryResponse,
+    ChatSessionSummaryRequest,
+    ChatSessionSummaryResponse,
     DeleteItemResponse,
     FeatureFlagsResponse,
     IngestImageRequest,
@@ -723,6 +725,38 @@ async def chat_query_unified(
                 )
                 for attachment in result.attachments
             ],
+        )
+    )
+
+
+@app.post("/chat/session-summary", response_model=ApiEnvelope)
+def chat_session_summary(payload: ChatSessionSummaryRequest) -> ApiEnvelope:
+    """Compress one archived chat conversation into summary metadata."""
+
+    try:
+        result = services.summarize_chat_session(
+            mode=payload.mode,
+            conversation_title=payload.conversation_title,
+            turns=[
+                {
+                    "mode": turn.mode,
+                    "user_message": turn.user_message,
+                    "answer": turn.answer,
+                    "strategy": turn.strategy,
+                }
+                for turn in payload.turns
+            ],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _ok(
+        ChatSessionSummaryResponse(
+            title=result.title,
+            summary=result.summary,
+            keywords=result.keywords,
+            compressed_transcript=result.compressed_transcript,
+            summary_source=result.summary_source,
         )
     )
 

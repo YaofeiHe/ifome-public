@@ -148,22 +148,24 @@ export default function MemoryPage() {
   const resumeSnapshot = lastSnapshot?.profile_memory?.resume_snapshot ?? null;
   const projectEntries = lastSnapshot?.profile_memory?.projects ?? [];
   const resumeFileUrl = `${API_BASE_URL}/memory/profile/resume-file`;
+  const latestWritebackSummary = lastSnapshot
+    ? `Profile ${(lastSnapshot.profile_memory?.projects ?? []).length} 个项目卡片，关注 ${(lastSnapshot.career_state_memory?.watched_companies ?? []).length} 家公司`
+    : null;
 
   return (
-    <main className="dashboard-grid">
-      <div className="memory-page-shell">
-        <section className="hero panel panel-hero">
-          <p className="eyebrow">Memory Control</p>
-          <h1>把长期画像、动态状态、项目画像和简历资料拆开管理</h1>
-          <p className="intro">
-            这里现在除了 `profile` 和 `career-state` 之外，还会展示聊天上传后即时整理好的项目画像和简历网页版本。你可以直接打开源文件，也可以把整理好的条目拷去其他表单或后续工具调用。
-          </p>
-        </section>
+    <main className="memory-page-shell">
+      <section className="hero panel panel-hero">
+        <p className="eyebrow">Memory Control</p>
+        <h1>把长期画像、动态状态、项目画像和简历资料拆开管理</h1>
+        <p className="intro">
+          这里现在除了 `profile` 和 `career-state` 之外，还会展示聊天上传后即时整理好的项目画像和简历网页版本。你可以直接打开源文件，也可以在聊天框里说“请用简历更新项目画像”，把已归档简历重新整理成项目卡片。
+        </p>
+      </section>
 
-        {message ? <section className="panel success-banner">{message}</section> : null}
-        {error ? <section className="panel error-banner">{error}</section> : null}
+      {message ? <section className="panel success-banner">{message}</section> : null}
+      {error ? <section className="panel error-banner">{error}</section> : null}
 
-        <section className="memory-grid">
+      <section className="memory-grid">
         <form className="panel stack-form" onSubmit={submitProfile}>
           <h2>长期画像</h2>
           <label className="field">
@@ -278,72 +280,76 @@ export default function MemoryPage() {
             {pending ? "保存中..." : "保存动态状态"}
           </button>
         </form>
-        </section>
+      </section>
 
-        <section className="panel memory-secondary-panel">
+      <section className="panel memory-secondary-panel">
         <h2>项目画像</h2>
         {loadingSnapshot ? (
           <p className="muted-text">正在读取当前 memory 快照...</p>
         ) : projectEntries.length === 0 ? (
           <p className="muted-text">
-            还没有导入项目说明。你可以在聊天框上传 README、项目说明、架构设计或方案文档，系统会自动整理成项目画像并在后续聊天里参与检索。
+            还没有导入项目说明。你可以在聊天框上传 README、项目说明、架构设计或方案文档，也可以直接说“请用简历更新项目画像”；系统会自动整理成项目画像卡片并在后续聊天里参与检索。
           </p>
         ) : (
           <div className="result-stack">
             {projectEntries.map((project) => {
               const projectFileUrl = `${API_BASE_URL}/memory/profile/project-file?project_name=${encodeURIComponent(project.name)}`;
               return (
-                <article key={project.name} className="panel panel-subtle">
-                  <div className="metric-row">
-                    <span className="metric-chip">{project.name}</span>
-                    {project.role ? <span className="metric-chip">{project.role}</span> : null}
-                    {project.source_file_name ? <span className="metric-chip">{project.source_file_name}</span> : null}
+                <details key={project.name} className="memory-collapsible-card" open>
+                  <summary className="memory-collapsible-summary">
+                    <div className="metric-row">
+                      <span className="metric-chip">{project.name}</span>
+                      {project.role ? <span className="metric-chip">{project.role}</span> : null}
+                    </div>
+                    <p className="muted-text">{project.summary}</p>
+                  </summary>
+                  <div className="result-stack">
+                    {project.source_file_name ? (
+                      <div className="metric-row">
+                        <span className="metric-chip">{project.source_file_name}</span>
+                        <a className="segment" href={projectFileUrl} rel="noreferrer" target="_blank">
+                          打开项目源文件
+                        </a>
+                      </div>
+                    ) : null}
+                    {project.tech_stack.length > 0 ? (
+                      <div className="tag-row">
+                        {project.tech_stack.map((value) => (
+                          <span key={value} className="tag-chip">
+                            {value}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                    {project.highlight_points.length > 0 ? (
+                      <div className="result-stack">
+                        <h3>亮点整理</h3>
+                        {project.highlight_points.map((value) => (
+                          <p key={value} className="muted-text">
+                            {value}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                    {project.interview_story_hooks.length > 0 ? (
+                      <div className="result-stack">
+                        <h3>面试切入口</h3>
+                        {project.interview_story_hooks.map((value) => (
+                          <p key={value} className="muted-text">
+                            {value}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
-                  <p>{project.summary}</p>
-                  {project.tech_stack.length > 0 ? (
-                    <div className="tag-row">
-                      {project.tech_stack.map((value) => (
-                        <span key={value} className="tag-chip">
-                          {value}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                  {project.highlight_points.length > 0 ? (
-                    <div className="result-stack">
-                      <h3>亮点整理</h3>
-                      {project.highlight_points.map((value) => (
-                        <p key={value} className="muted-text">
-                          {value}
-                        </p>
-                      ))}
-                    </div>
-                  ) : null}
-                  {project.interview_story_hooks.length > 0 ? (
-                    <div className="result-stack">
-                      <h3>面试切入口</h3>
-                      {project.interview_story_hooks.map((value) => (
-                        <p key={value} className="muted-text">
-                          {value}
-                        </p>
-                      ))}
-                    </div>
-                  ) : null}
-                  {project.source_file_name ? (
-                    <p>
-                      <a className="segment" href={projectFileUrl} rel="noreferrer" target="_blank">
-                        打开项目源文件
-                      </a>
-                    </p>
-                  ) : null}
-                </article>
+                </details>
               );
             })}
           </div>
         )}
-        </section>
+      </section>
 
-        <section className="panel memory-secondary-panel">
+      <section className="panel memory-secondary-panel">
         <h2>简历资料</h2>
         {loadingSnapshot ? (
           <p className="muted-text">正在读取当前 memory 快照...</p>
@@ -412,23 +418,41 @@ export default function MemoryPage() {
               </div>
             ) : null}
 
-            <div className="routing-box">
-              <h3>简历原文</h3>
-              <pre>{resumeSnapshot.text}</pre>
-            </div>
+            <details className="memory-collapsible-card">
+              <summary className="memory-collapsible-summary">
+                <div className="metric-row">
+                  <span className="metric-chip">简历原文</span>
+                  <span className="muted-text">
+                    {resumeSnapshot.summary || "点击展开完整文本"}
+                  </span>
+                </div>
+              </summary>
+              <div className="routing-box">
+                <pre>{resumeSnapshot.text}</pre>
+              </div>
+            </details>
           </div>
         )}
-        </section>
+      </section>
 
-        <section className="panel memory-secondary-panel">
-          <h2>最近回写结果</h2>
-          {!lastSnapshot ? (
-            <p className="muted-text">提交一次 profile、career-state 或简历导入后，这里会展示最新回写结果。</p>
-          ) : (
+      <section className="panel memory-secondary-panel">
+        <h2>最近回写结果</h2>
+        {!lastSnapshot ? (
+          <p className="muted-text">提交一次 profile、career-state 或简历导入后，这里会展示最新回写结果。</p>
+        ) : (
+          <details className="memory-collapsible-card">
+            <summary className="memory-collapsible-summary">
+              <div className="metric-row">
+                <span className="metric-chip">最近回写结果</span>
+                <span className="muted-text">
+                  {latestWritebackSummary || "点击展开 JSON 快照"}
+                </span>
+              </div>
+            </summary>
             <pre className="snapshot-box memory-snapshot-box">{JSON.stringify(lastSnapshot, null, 2)}</pre>
-          )}
-        </section>
-      </div>
+          </details>
+        )}
+      </section>
     </main>
   );
 }

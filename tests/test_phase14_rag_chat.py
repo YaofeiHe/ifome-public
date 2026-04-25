@@ -268,6 +268,57 @@ def test_chat_query_unified_updates_project_memory_from_attachment() -> None:
     assert profile.projects[0].source_file_name is not None
 
 
+def test_chat_query_can_refresh_project_cards_from_saved_resume_snapshot() -> None:
+    """An explicit chat request should rebuild project cards from the already saved resume snapshot."""
+
+    services = ApiServiceContainer(
+        dependencies=WorkflowDependencies(
+            llm_gateway=NoopLLMGateway(),
+        )
+    )
+
+    services.chat_query_enhanced(
+        query="请先保存这份简历",
+        user_id="demo_user",
+        workspace_id="resume_project_workspace",
+        uploaded_files=[
+            (
+                "我的简历.txt",
+                (
+                    "姓名：张三\n"
+                    "教育经历：XX 大学 计算机\n"
+                    "项目经历\n"
+                    "RAG 求职助手\n"
+                    "负责统一处理岗位链接、聊天截图、简历与项目说明。\n"
+                    "技术栈：Python FastAPI Next.js Qdrant\n"
+                    "项目经历\n"
+                    "Agent 工作流控制台\n"
+                    "负责工作流编排、状态传递和卡片渲染。\n"
+                ).encode("utf-8"),
+            )
+        ],
+        apply_memory_updates=True,
+    )
+
+    result = services.chat_query_enhanced(
+        query="请用简历更新项目画像",
+        user_id="demo_user",
+        workspace_id="resume_project_workspace",
+        apply_memory_updates=True,
+    )
+
+    current_memory = services.dependencies.memory_provider.load(
+        user_id="demo_user",
+        workspace_id="resume_project_workspace",
+    )
+    profile = current_memory["profile_memory"]
+
+    assert result.memory_update.applied is True
+    assert "projects" in result.memory_update.profile_fields
+    assert profile.projects
+    assert any(project.name for project in profile.projects)
+
+
 def test_pdf_attachment_falls_back_to_ocr_when_text_extraction_fails(tmp_path) -> None:
     """PDF attachments should fallback to OCR instead of failing fast."""
 
@@ -396,3 +447,37 @@ def test_chat_query_expands_sparse_job_listing_requests_into_name_and_link_answe
     assert result.query_analysis.rewritten_query
     assert result.query_analysis.retrieval_queries
     assert "https://jobs.example.com/" in result.answer
+
+
+def test_chat_session_summary_falls_back_without_live_llm() -> None:
+    """Archived chat conversations should still get deterministic summary metadata locally."""
+
+    services = ApiServiceContainer(
+        dependencies=WorkflowDependencies(
+            llm_gateway=NoopLLMGateway(),
+        )
+    )
+
+    result = services.summarize_chat_session(
+        mode="boss_simulator",
+        conversation_title="阿里沟通",
+        turns=[
+            {
+                "mode": "boss_simulator",
+                "user_message": "您好，这周可以安排一轮沟通吗？",
+                "answer": "可以的，我周三和周四下午都可以。",
+                "strategy": "先给出明确可约时间，降低来回确认成本。",
+            },
+            {
+                "mode": "boss_simulator",
+                "user_message": "方便再发一下你的简历和项目介绍吗？",
+                "answer": "好的，我现在把简历和项目说明一并发您，也补充一下我的 Agent 项目重点。",
+                "strategy": "顺势补充项目亮点，让后续面试官更容易抓到重点。",
+            },
+        ],
+    )
+
+    assert result.title
+    assert result.summary
+    assert result.keywords
+    assert "最近窗口" in result.compressed_transcript

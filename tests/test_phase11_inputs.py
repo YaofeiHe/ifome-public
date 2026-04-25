@@ -444,6 +444,11 @@ def test_refresh_market_watch_searches_recent_articles_from_configured_sources(
     assert overview_card.ai_score is not None
     assert all(state.render_card and state.render_card.message_time is not None for state in article_states)
     assert all(
+        state.render_card
+        and state.render_card.summary_one_line == state.source_metadata.get("market_article_title")
+        for state in article_states
+    )
+    assert all(
         state.render_card and state.render_card.market_parent_item_id == overview_card.item_id
         for state in article_states
     )
@@ -541,6 +546,70 @@ def test_refresh_market_watch_keeps_real_child_cards_when_only_titles_are_availa
     assert all(
         state.render_card and state.render_card.summary_one_line for state in article_states
     )
+
+
+def test_list_items_repairs_old_market_child_titles_and_parent_previews(tmp_path, monkeypatch) -> None:
+    """Older persisted market cards should be repaired to use explicit article titles when listed."""
+
+    monkeypatch.chdir(tmp_path)
+    services = ApiServiceContainer(
+        dependencies=WorkflowDependencies(
+            web_page_client=FakeWebPageClient(),
+            search_client=FakeSearchClient(),
+        )
+    )
+
+    memory_payload = services.dependencies.memory_provider.load(
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+    )
+    career_state = memory_payload["career_state_memory"].model_copy(
+        update={"market_watch_sources": ["https://www.jiqizhixin.com/"]}
+    )
+    services.upsert_career_state_memory(career_state)
+
+    refreshed, _, states, _ = services.refresh_market_watch(
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+        force=True,
+    )
+
+    assert refreshed is True
+    overview = next(
+        state for state in states if state.render_card and state.render_card.market_group_kind == "overview"
+    )
+    article_states = [
+        state for state in states if state.render_card and state.render_card.market_group_kind == "article"
+    ]
+    assert article_states
+
+    broken_title = "机器之心推出数据服务，强调高效稳定数据获取能力，提及华为云合作背书"
+    for article_state in article_states:
+        article_state.render_card.summary_one_line = broken_title
+        if article_state.extracted_signal is not None:
+            article_state.extracted_signal.summary_one_line = broken_title
+        services.dependencies.workflow_repository.save(article_state)
+
+    overview.render_card.market_child_previews = [broken_title] * len(article_states)
+    overview.source_metadata["market_child_previews"] = [broken_title] * len(article_states)
+    services.dependencies.workflow_repository.save(overview)
+
+    repaired_states = services.list_items(user_id="demo_user", workspace_id="demo_workspace")
+    repaired_articles = [
+        state for state in repaired_states if state.render_card and state.render_card.market_group_kind == "article"
+    ]
+    repaired_overview = next(
+        state
+        for state in repaired_states
+        if state.render_card and state.render_card.market_group_kind == "overview"
+    )
+
+    assert all(
+        state.render_card and state.render_card.summary_one_line == state.source_metadata.get("market_article_title")
+        for state in repaired_articles
+    )
+    assert repaired_overview.render_card is not None
+    assert broken_title not in repaired_overview.render_card.market_child_previews
 
 
 def test_refresh_market_watch_prefers_qbitai_site_level_title_discovery(
