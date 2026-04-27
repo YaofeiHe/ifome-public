@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from core.runtime.time import now_in_project_timezone
 from core.runtime.settings import AppSettings, LLMSettings, OCRSettings
 
 
@@ -135,6 +136,7 @@ class OpenAICompatibleVisionOCRClient:
         data_url = self._build_data_url(image_path, image_bytes)
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         last_error: RuntimeError | None = None
+        current_timestamp = now_in_project_timezone().isoformat()
 
         for index, model_name in enumerate(self.model_candidates):
             body = {
@@ -144,6 +146,7 @@ class OpenAICompatibleVisionOCRClient:
                     {
                         "role": "system",
                         "content": (
+                            f"当前时间戳：{current_timestamp}\n\n"
                             "你是一个严格的 OCR 转写助手。"
                             "请忠实提取图片中的文字，尽量保持段落与换行，不要总结，不要解释。"
                         ),
@@ -154,6 +157,7 @@ class OpenAICompatibleVisionOCRClient:
                             {
                                 "type": "text",
                                 "text": (
+                                    f"当前时间戳：{current_timestamp}\n"
                                     "请输出图片中的全部可见文字。"
                                     "如果存在表格或列表，尽量按阅读顺序转成纯文本。"
                                 ),

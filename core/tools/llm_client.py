@@ -10,6 +10,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from core.runtime.time import now_in_project_timezone
 from core.runtime.settings import LLMSettings, ProviderSettings
 
 
@@ -78,16 +79,24 @@ class OpenAICompatibleLLMGateway:
         provider = self._resolve_provider(route)
         endpoint = f"{provider.base_url.rstrip('/')}/chat/completions"
         last_error: Exception | None = None
+        current_timestamp = now_in_project_timezone().isoformat()
+        timestamped_system_prompt = (
+            f"当前时间戳：{current_timestamp}\n\n{system_prompt}"
+        )
+        timestamped_user_payload = {
+            "current_timestamp": current_timestamp,
+            **user_payload,
+        }
 
         for index, model_name in enumerate(provider.model_candidates):
             body = {
                 "model": model_name,
                 "temperature": 0.1,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": timestamped_system_prompt},
                     {
                         "role": "user",
-                        "content": json.dumps(user_payload, ensure_ascii=False, indent=2),
+                        "content": json.dumps(timestamped_user_payload, ensure_ascii=False, indent=2),
                     },
                 ],
             }

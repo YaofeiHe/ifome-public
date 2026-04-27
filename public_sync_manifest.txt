@@ -31,6 +31,7 @@ docs/assets/*.png
 docs/assets/*.jpg
 docs/architecture.md
 docs/future_roadmap.md
+docs/input_chat_card_update_summary.md
 docs/job_agent_engineering_doc.md
 docs/job_agent_whitepaper.md
 docs/memory_design.md

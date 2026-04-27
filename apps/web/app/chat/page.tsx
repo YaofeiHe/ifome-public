@@ -216,11 +216,14 @@ function formatTimestamp(value: string) {
 
 export default function ChatPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const restoredConversationIdRef = useRef<string | null>(null);
   const [items, setItems] = useState<RenderedItemCard[]>([]);
   const [conversations, setConversations] = useState<ChatConversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [expandedConversationIds, setExpandedConversationIds] = useState<string[]>([]);
   const [expandedTurnIds, setExpandedTurnIds] = useState<string[]>([]);
+  const [expandedStrategyTurnIds, setExpandedStrategyTurnIds] = useState<string[]>([]);
   const [query, setQuery] = useState("给我本周的 ddl");
   const [mode, setMode] = useState<ChatMode>("grounded_chat");
   const [itemId, setItemId] = useState("");
@@ -303,6 +306,10 @@ export default function ChatPage() {
     if (!activeConversation) {
       return;
     }
+    if (restoredConversationIdRef.current === activeConversation.id) {
+      return;
+    }
+    restoredConversationIdRef.current = activeConversation.id;
     setMode(activeConversation.mode);
     setItemId(activeConversation.itemId);
     setRecentDays(activeConversation.recentDays);
@@ -320,21 +327,35 @@ export default function ChatPage() {
     if (!activeConversationId) {
       return;
     }
-    setConversations((current) =>
-      current.map((conversation) =>
-        conversation.id === activeConversationId
-          ? {
-              ...conversation,
-              mode,
-              itemId,
-              recentDays,
-              applyMemoryUpdates,
-              queryDraft: query,
-              bossReplyRequirements,
-            }
-          : conversation,
-      ),
-    );
+    setConversations((current) => {
+      let changed = false;
+      const nextConversations = current.map((conversation) => {
+        if (conversation.id !== activeConversationId) {
+          return conversation;
+        }
+        if (
+          conversation.mode === mode &&
+          conversation.itemId === itemId &&
+          conversation.recentDays === recentDays &&
+          conversation.applyMemoryUpdates === applyMemoryUpdates &&
+          conversation.queryDraft === query &&
+          conversation.bossReplyRequirements === bossReplyRequirements
+        ) {
+          return conversation;
+        }
+        changed = true;
+        return {
+          ...conversation,
+          mode,
+          itemId,
+          recentDays,
+          applyMemoryUpdates,
+          queryDraft: query,
+          bossReplyRequirements,
+        };
+      });
+      return changed ? nextConversations : current;
+    });
   }, [
     mode,
     itemId,
@@ -494,6 +515,37 @@ export default function ChatPage() {
       return remaining;
     });
     setExpandedConversationIds((current) => current.filter((value) => value !== conversationId));
+    setSelectedConversationIds((current) => current.filter((value) => value !== conversationId));
+  }
+
+  function deleteSelectedConversations() {
+    if (selectedConversationIds.length === 0) {
+      return;
+    }
+    const targets = new Set(selectedConversationIds);
+    setConversations((current) => {
+      const remaining = current.filter((conversation) => !targets.has(conversation.id));
+      if (remaining.length === 0) {
+        const nextConversation = createConversation();
+        setActiveConversationId(nextConversation.id);
+        setExpandedConversationIds([nextConversation.id]);
+        return [nextConversation];
+      }
+      if (activeConversationId && targets.has(activeConversationId)) {
+        setActiveConversationId(remaining[0].id);
+      }
+      return remaining;
+    });
+    setExpandedConversationIds((current) => current.filter((value) => !targets.has(value)));
+    setSelectedConversationIds([]);
+  }
+
+  function toggleConversationSelection(conversationId: string) {
+    setSelectedConversationIds((current) =>
+      current.includes(conversationId)
+        ? current.filter((value) => value !== conversationId)
+        : [...current, conversationId],
+    );
   }
 
   function deleteTurn(turnId: string) {
@@ -507,6 +559,7 @@ export default function ChatPage() {
       summaryCard: null,
     }));
     setExpandedTurnIds((current) => current.filter((value) => value !== turnId));
+    setExpandedStrategyTurnIds((current) => current.filter((value) => value !== turnId));
     setBossAdjustmentPrompts((current) => {
       const next = { ...current };
       delete next[turnId];
@@ -524,6 +577,12 @@ export default function ChatPage() {
 
   function toggleTurn(turnId: string) {
     setExpandedTurnIds((current) =>
+      current.includes(turnId) ? current.filter((value) => value !== turnId) : [...current, turnId],
+    );
+  }
+
+  function toggleStrategy(turnId: string) {
+    setExpandedStrategyTurnIds((current) =>
       current.includes(turnId) ? current.filter((value) => value !== turnId) : [...current, turnId],
     );
   }
@@ -713,7 +772,7 @@ export default function ChatPage() {
         </p>
       </section>
 
-      <section className="panel">
+      <section className="panel conversation-history-panel">
         <div className="conversation-toolbar">
           <div>
             <h2>对话列表</h2>
@@ -728,6 +787,14 @@ export default function ChatPage() {
           >
             创建新对话
           </button>
+          <button
+            type="button"
+            className="segment"
+            disabled={selectedConversationIds.length === 0}
+            onClick={deleteSelectedConversations}
+          >
+            删除选中（{selectedConversationIds.length}）
+          </button>
         </div>
 
         <div className="conversation-list">
@@ -740,6 +807,14 @@ export default function ChatPage() {
                 className={`conversation-card ${isActive ? "conversation-card-active" : ""}`}
               >
                 <div className="conversation-card-header">
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={selectedConversationIds.includes(conversation.id)}
+                      onChange={() => toggleConversationSelection(conversation.id)}
+                    />
+                    <span>选择</span>
+                  </label>
                   <button
                     type="button"
                     className="segment chat-history-toggle"
@@ -809,6 +884,19 @@ export default function ChatPage() {
 
       <section className="panel">
         <form className="stack-form" onSubmit={onSubmit}>
+          <div className="conversation-toolbar">
+            <div>
+              <h2>{mode === "boss_simulator" ? "Boss 对话框" : "聊天问答框"}</h2>
+              <p className="muted-text">当前对话会持续缓存；需要另起主题时可以直接创建新对话。</p>
+            </div>
+            <button
+              type="button"
+              className="segment"
+              onClick={() => void createNewConversation()}
+            >
+              创建新对话
+            </button>
+          </div>
           <div className="segmented-control">
             <button
               type="button"
@@ -939,9 +1027,9 @@ export default function ChatPage() {
           </p>
         ) : (
           <div className="chat-history-list">
-            {[...activeConversation.turns].reverse().map((turn, reversedIndex) => {
+            {activeConversation.turns.map((turn, turnIndex) => {
               const expanded = expandedTurnIds.includes(turn.id);
-              const round = activeConversation.turns.length - reversedIndex;
+              const round = turnIndex + 1;
               return (
                 <article key={turn.id} className="chat-history-card">
                   <div className="chat-history-summary">
@@ -985,10 +1073,6 @@ export default function ChatPage() {
                             </div>
                             <p>{turn.answer}</p>
                           </article>
-                          <div className="chat-strategy-box">
-                            <p className="workspace-kicker">回复策略</p>
-                            <p>{turn.strategy || "暂无策略说明。"}</p>
-                          </div>
                           <div className="chat-feedback-box">
                             <label className="field">
                               <span>这轮回复评价 / 调整提示词</span>
@@ -1018,6 +1102,21 @@ export default function ChatPage() {
                               </button>
                             </div>
                           </div>
+                          <button
+                            type="button"
+                            className="segment chat-strategy-toggle"
+                            onClick={() => toggleStrategy(turn.id)}
+                          >
+                            {expandedStrategyTurnIds.includes(turn.id)
+                              ? "收起回复策略和分析"
+                              : "展开回复策略和分析"}
+                          </button>
+                          {expandedStrategyTurnIds.includes(turn.id) ? (
+                            <div className="chat-strategy-box">
+                              <p className="workspace-kicker">回复策略</p>
+                              <p>{turn.strategy || "暂无策略说明。"}</p>
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     ) : (

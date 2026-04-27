@@ -819,9 +819,9 @@ export default function ItemsPage() {
                         ? `收起岗位列表（${previewCount}）`
                         : `展开岗位列表（${previewCount}）`}
                     </button>
-                    {item.job_child_previews.map((preview) => (
+                    {item.job_child_previews.map((preview, previewIndex) => (
                       <button
-                        key={preview}
+                        key={`${item.item_id}-${preview}-${previewIndex}`}
                         type="button"
                         className="tag-chip tag-chip-button"
                         onClick={(event) => {
@@ -1175,9 +1175,9 @@ export default function ItemsPage() {
                         ? `收起文章列表（${previewCount}）`
                         : `展开文章列表（${previewCount}）`}
                     </button>
-                    {item.market_child_previews.map((preview) => (
+                    {item.market_child_previews.map((preview, previewIndex) => (
                       <button
-                        key={preview}
+                        key={`${item.item_id}-${preview}-${previewIndex}`}
                         type="button"
                         className="tag-chip tag-chip-button"
                         onClick={(event) => {

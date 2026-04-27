@@ -2290,6 +2290,7 @@ for path in renderedPaths {
                 continue
 
             ordered_titles: list[str] = []
+            seen_ordered_titles: set[str] = set()
             child_ids = list(state.render_card.market_child_item_ids or [])
             for child_id in child_ids:
                 child_state = next(
@@ -2304,9 +2305,19 @@ for path in renderedPaths {
                 )
                 if child_state is None or not child_state.render_card.summary_one_line:
                     continue
-                ordered_titles.append(child_state.render_card.summary_one_line)
+                title = child_state.render_card.summary_one_line
+                title_key = re.sub(r"\s+", " ", title).strip().lower()
+                if title_key in seen_ordered_titles:
+                    continue
+                seen_ordered_titles.add(title_key)
+                ordered_titles.append(title)
             if not ordered_titles:
-                ordered_titles = article_titles_by_parent.get(state.normalized_item.id, [])
+                for title in article_titles_by_parent.get(state.normalized_item.id, []):
+                    title_key = re.sub(r"\s+", " ", title).strip().lower()
+                    if title_key in seen_ordered_titles:
+                        continue
+                    seen_ordered_titles.add(title_key)
+                    ordered_titles.append(title)
 
             preview_limit = max(
                 len(state.render_card.market_child_previews),
@@ -3175,6 +3186,8 @@ for path in renderedPaths {
                 ranked_candidates = self._rank_market_article_candidates(
                     source_url=url,
                     candidates=discovered_candidates,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
                     profile_memory=profile_memory,
                     career_state_memory=career_state_memory,
                 )
@@ -5080,6 +5093,8 @@ for path in renderedPaths {
         *,
         source_url: str,
         candidates: list[dict[str, str | None]],
+        user_id: str,
+        workspace_id: str | None,
         profile_memory: ProfileMemory,
         career_state_memory: CareerStateMemory,
     ) -> list[MarketArticleCandidate]:
@@ -5092,12 +5107,19 @@ for path in renderedPaths {
         )
 
         ranked: list[MarketArticleCandidate] = []
+        seen_urls: set[str] = set()
+        seen_titles: set[str] = set()
         for candidate in candidates:
             url = str(candidate.get("url") or "").strip()
             title = str(candidate.get("title") or "").strip()
             snippet = str(candidate.get("snippet") or "").strip()
             if not url or not title:
                 continue
+            title_key = re.sub(r"\s+", " ", title).strip().lower()
+            if url in seen_urls or title_key in seen_titles:
+                continue
+            seen_urls.add(url)
+            seen_titles.add(title_key)
             relevance_score = self._score_market_title_relevance(
                 title=title,
                 snippet=snippet,
@@ -5144,8 +5166,146 @@ for path in renderedPaths {
                 )
             )
 
+        llm_rank_payload = self._rank_market_titles_with_llm(
+            source_url=source_url,
+            candidates=ranked,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            profile_terms=profile_terms,
+            keyword_terms=keyword_terms,
+        )
+        if llm_rank_payload:
+            llm_by_url = {
+                str(item.get("url") or "").strip(): item
+                for item in llm_rank_payload
+                if str(item.get("url") or "").strip()
+            }
+            reranked: list[MarketArticleCandidate] = []
+            for candidate in ranked:
+                llm_item = llm_by_url.get(candidate.url)
+                if not llm_item:
+                    reranked.append(candidate)
+                    continue
+                llm_score = self._coerce_score(llm_item.get("llm_score"), candidate.llm_score)
+                brief = str(llm_item.get("brief") or "").strip() or candidate.brief
+                reason = str(llm_item.get("reason") or "").strip() or candidate.reason
+                title_score = round(
+                    min(
+                        0.48 * llm_score
+                        + 0.32 * candidate.relevance_score
+                        + 0.15 * candidate.market_value_score
+                        + 0.05 * min(candidate.diversity_gap_score, 0.7),
+                        0.99,
+                    ),
+                    4,
+                )
+                reranked.append(
+                    replace(
+                        candidate,
+                        llm_score=round(llm_score, 4),
+                        title_score=title_score,
+                        brief=brief[:36],
+                        reason=reason,
+                        selection_mode="llm_keyword_blend",
+                    )
+                )
+            ranked = reranked
+
         ranked.sort(key=lambda item: item.title_score, reverse=True)
         return ranked
+
+    def _rank_market_titles_with_llm(
+        self,
+        *,
+        source_url: str,
+        candidates: list[MarketArticleCandidate],
+        user_id: str,
+        workspace_id: str | None,
+        profile_terms: list[str],
+        keyword_terms: list[str],
+    ) -> list[dict[str, Any]]:
+        """Ask the configured LLM to score title-level candidates, with retrieval context."""
+
+        if not candidates:
+            return []
+
+        route = self.dependencies.model_router.select("chat", "low")
+        if not self.dependencies.llm_gateway.is_available(route):
+            return []
+
+        query_text = "\n".join(
+            [
+                f"来源：{source_url}",
+                f"画像关注：{'、'.join(profile_terms[:10])}",
+                "候选标题：",
+                *[f"- {item.title} | {item.snippet[:120]}" for item in candidates[:24]],
+            ]
+        )
+        try:
+            prompt_references = collect_prompt_references(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                current_item_id=None,
+                query_text=query_text,
+                source_metadata={
+                    "source_title": "market_watch_title_ranking",
+                    "keyword_hints": keyword_terms[:12],
+                    "market_watch": True,
+                },
+                workflow_repository=self.dependencies.workflow_repository,
+                search_client=self.dependencies.search_client,
+                embedding_gateway=self.dependencies.embedding_gateway,
+                vector_store=self.dependencies.vector_store,
+                embed_route="dashscope:embedding",
+                category_hint=ContentCategory.GENERAL_UPDATE.value,
+                limit=4,
+            )
+        except Exception:
+            prompt_references = []
+
+        try:
+            prompt = self.dependencies.prompt_loader.load("market_watch_title_rank")
+            response = self.dependencies.llm_gateway.complete_json(
+                route=route,
+                task_name="market_watch_title_rank",
+                system_prompt=prompt,
+                user_payload={
+                    "source_url": source_url,
+                    "profile_terms": profile_terms[:12],
+                    "keyword_terms": keyword_terms[:18],
+                    "prompt_references": [
+                        reference.to_payload() for reference in prompt_references
+                    ],
+                    "items": [
+                        {
+                            "title": item.title,
+                            "url": item.url,
+                            "snippet": item.snippet[:500],
+                            "keyword_score": item.relevance_score,
+                            "market_value_score": item.market_value_score,
+                            "published_at": item.published_at,
+                            "candidate_source": item.candidate_source,
+                        }
+                        for item in candidates[:24]
+                    ],
+                },
+            )
+        except Exception:
+            return []
+
+        items = response.get("items")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    def _coerce_score(self, value: Any, fallback: float) -> float:
+        """Normalize arbitrary LLM score output into the 0-1 range."""
+
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return max(0.0, min(score, 1.0))
 
     def _select_market_article_candidates(
         self,
@@ -5605,11 +5765,13 @@ for path in renderedPaths {
         if not ranked_candidates:
             return None
         overview_title = self._build_market_overview_title(source_url)
-        actual_child_previews = [
-            str(child_state.source_metadata.get("market_title_brief") or "").strip()
-            for child_state in child_states
-            if str(child_state.source_metadata.get("market_title_brief") or "").strip()
-        ]
+        actual_child_previews = list(
+            dict.fromkeys(
+                str(child_state.source_metadata.get("market_title_brief") or "").strip()
+                for child_state in child_states
+                if str(child_state.source_metadata.get("market_title_brief") or "").strip()
+            )
+        )
 
         raw_input = self._compose_market_title_overview_payload(
             source_url=source_url,

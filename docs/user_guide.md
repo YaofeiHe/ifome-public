@@ -139,6 +139,7 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 - 一张图片
 - 一个 PDF 或文本文件
 - 一行本地图片 / 文件路径
+- 同一主题下的多轮输入，页面会保存在同一个历史里
 
 适合录入的内容包括：
 
@@ -202,6 +203,8 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 - 输入产生的原始文本、上传图片、上传文件和本地路径副本会统一归档到 `data/runtime/source_files/`
 - 直接输入的文本会存成 `.txt`
 - 卡片列表和详情页会提供“访问源文件”入口
+- 当前历史会按时间顺序完整展示每轮输入与输出
+- 页面底部的输入历史列表可以继续输入、删除单个历史或多选删除
 
 ### `/items`
 
@@ -236,6 +239,8 @@ ifome push-public --target /path/to/github-repo --github-token-file ~/GITHUB_TOK
 - 模拟 Boss / HR 沟通回复
 - 支持在 Boss 模式单独输入“回答提示 / 回复要求”
 - 支持对历史某一轮回复追加评价提示并重生成
+- 当前对话会按时间顺序完整展示，底部历史列表可切换、删除或多选删除
+- Boss 回复模拟中，建议回复下方常驻修改提示框，回复策略和分析可按需展开
 
 - 基于已有条目和 memory 继续追问
 

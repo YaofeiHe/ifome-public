@@ -264,6 +264,13 @@ h2 {
 .conversation-list {
   display: grid;
   gap: 14px;
+  max-height: 430px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.conversation-history-panel {
+  order: 80;
 }
 
 .conversation-card {
@@ -333,6 +340,12 @@ h2 {
   text-align: left;
   justify-content: flex-start;
   max-width: 100%;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  line-height: 1.45;
 }
 
 .chat-turn {
@@ -388,6 +401,10 @@ h2 {
   border: 1px dashed rgba(116, 49, 18, 0.22);
   background: rgba(255, 250, 242, 0.84);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+
+.chat-strategy-toggle {
+  justify-self: end;
 }
 
 .chat-strategy-box p {

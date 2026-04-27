@@ -64,12 +64,12 @@
 关键文件：
 
 - `apps/web/app/page.tsx`：首页总览。
-- `apps/web/app/ingest/page.tsx`：统一文本 / 链接输入页和截图输入页。
+- `apps/web/app/ingest/page.tsx`：统一文本 / 链接 / 文件输入页，支持同一主题多轮输入、本地缓存历史、底部历史列表、单个或多选删除。
 - `apps/web/app/items/page.tsx`：卡片列表页，支持编辑、删除、批量删除和详情查看。
 - `apps/web/app/items/page.tsx`：卡片列表页，支持点击切换 `求职活动 / 市场信息`、编辑、删除、批量删除、详情查看、市场总览卡片下“展开文章列表（N）”按钮触发的小卡片列表展开，也支持求职活动里的多岗位 overview 卡下“展开岗位列表（N）”查看子岗位卡片，以及收敛后的单一市场刷新按钮与市场信息区直接显示批量删除入口。
 - `apps/web/app/items/page.tsx`：同时负责把列表里的所有时间统一格式化成 `年月日 + 时分秒` 的前端显示格式。
 - `apps/web/app/memory/page.tsx`：记忆管理页，市场监控源通过可滚动表格维护，并且可以直接配置每个来源单次刷新时的市场文章抓取上限；简历原文和最近回写结果会作为可展开小卡片显示。
-- `apps/web/app/chat/page.tsx`：聊天控制台页，支持按时间窗口做近期卡片检索、用已归档简历更新项目画像，以及把 Boss / HR 模拟回复保存成可展开的历史列表并按单轮评价重生成。
+- `apps/web/app/chat/page.tsx`：聊天控制台页，支持按时间窗口做近期卡片检索、用已归档简历更新项目画像、多会话缓存、底部历史列表，以及把 Boss / HR 模拟回复保存成社交软件式对话并按单轮评价重生成。
 - `apps/web/app/lib/api.ts`：前端请求后端的统一封装。
 - `apps/web/__init__.py`：让前端源码可以随安装包一起分发，供统一启动器在非源码场景下准备运行目录。
 - `scripts/market_watch_recent_titles.py`：本地命令行脚本，用来单独测试某个站点是否能直接抓出近 24 小时标题列表。
@@ -247,7 +247,7 @@
   - 再从前端 bundle 里确认 `article_library/articles.json` 列表 API
   - 用这个 API 导出近 24 小时标题和发布时间
   - 如果详情页匿名抓取失败，就先用 API 自带摘要回退生成市场子卡
-- `prompts/market_watch_title_rank.md`：市场文章标题级筛选 prompt 预留位；当前线上主逻辑已经改成确定性关键词排序，不再把它作为第一优先级。
+- `prompts/market_watch_title_rank.md`：市场文章标题级筛选 prompt；live LLM 可用时会结合画像关键词、规则分、历史卡片 / 向量召回参考输出 `llm_score`，再与关键词分融合排序。
 - `prompts/market_watch_overview.md`：固定来源标题列表的大卡片总览 prompt。
 - `core/tools/vector_store.py`：Qdrant REST vector store 适配器。
 - `core/tools/email_client.py`、`calendar_client.py`、`web_push_client.py`：通知接口预留。
