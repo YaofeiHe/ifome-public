@@ -5,6 +5,7 @@ import { type MouseEvent, useDeferredValue, useEffect, useMemo, useState } from 
 import {
   BatchAnalyzeItemsResponse,
   BatchDeleteItemsResponse,
+  DeleteItemResponse,
   ItemDetailResponse,
   ItemListResponse,
   MarketRefreshResponse,
@@ -378,17 +379,17 @@ export default function ItemsPage() {
   async function onDelete(itemId: string) {
     setError(null);
     try {
-      const targetItem = items.find((item) => item.item_id === itemId) || null;
-      await apiRequest(`/items/${itemId}`, {
+      const response = await apiRequest<DeleteItemResponse>(`/items/${itemId}`, {
         method: "DELETE",
       });
-      const hiddenChildIds = new Set(targetItem?.market_child_item_ids || []);
-      for (const childId of targetItem?.job_child_item_ids || []) {
-        hiddenChildIds.add(childId);
+      const deletedIds = new Set(response.data.deleted_item_ids || [itemId]);
+      if (deletedIds.size === 0) {
+        deletedIds.add(itemId);
       }
-      hiddenChildIds.add(itemId);
-      setItems((current) => current.filter((item) => !hiddenChildIds.has(item.item_id)));
-      setSelectedItemIds((current) => current.filter((value) => !hiddenChildIds.has(value)));
+      setItems((current) => current.filter((item) => !deletedIds.has(item.item_id)));
+      setSelectedItemIds((current) => current.filter((value) => !deletedIds.has(value)));
+      setExpandedMarketIds((current) => current.filter((value) => !deletedIds.has(value)));
+      setExpandedJobIds((current) => current.filter((value) => !deletedIds.has(value)));
     } catch (requestError) {
       setError(
         requestError instanceof Error ? requestError.message : "删除失败，请稍后重试。",

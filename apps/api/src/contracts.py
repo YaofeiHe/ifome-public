@@ -510,6 +510,10 @@ class DeleteItemResponse(BaseModel):
     """Response payload for one delete action."""
 
     item_id: str = Field(description="Identifier of the deleted item.")
+    deleted_item_ids: list[str] = Field(
+        default_factory=list,
+        description="Identifiers removed by this delete, including cascade-deleted children.",
+    )
 
 
 class BatchDeleteItemsRequest(BaseModel):

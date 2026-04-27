@@ -638,6 +638,67 @@ def test_items_can_be_batch_deleted(tmp_path, monkeypatch) -> None:
     assert services.list_items(user_id="demo_user", workspace_id="demo_workspace") == []
 
 
+def test_deleting_market_overview_cascades_children_and_source_files(
+    tmp_path, monkeypatch
+) -> None:
+    """Deleting one market overview should remove child cards and archived source files."""
+
+    monkeypatch.chdir(tmp_path)
+    services = ApiServiceContainer(
+        dependencies=WorkflowDependencies(
+            llm_gateway=NoopLLMGateway(),
+        )
+    )
+
+    child = services.ingest(
+        raw_input="市场正文：AI Agent 工程化平台发布，适合继续关注。",
+        source_type=SourceType.TEXT,
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+        source_metadata={
+            "market_watch": True,
+            "market_group_kind": "article",
+            "force_content_category": ContentCategory.GENERAL_UPDATE.value,
+        },
+    )
+    parent = services.ingest(
+        raw_input="市场总览：机器之心今日更新。",
+        source_type=SourceType.TEXT,
+        user_id="demo_user",
+        workspace_id="demo_workspace",
+        source_metadata={
+            "market_watch": True,
+            "market_group_kind": "overview",
+            "force_content_category": ContentCategory.GENERAL_UPDATE.value,
+        },
+    )
+
+    assert child.normalized_item is not None
+    assert parent.normalized_item is not None
+    assert child.render_card is not None
+    assert parent.render_card is not None
+
+    child_path = Path(child.source_metadata["archived_source_path"])
+    parent_path = Path(parent.source_metadata["archived_source_path"])
+    assert child_path.exists()
+    assert parent_path.exists()
+
+    child.source_metadata["market_parent_item_id"] = parent.normalized_item.id
+    child.render_card.market_parent_item_id = parent.normalized_item.id
+    parent.source_metadata["market_child_item_ids"] = [child.normalized_item.id]
+    parent.render_card.market_child_item_ids = [child.normalized_item.id]
+    services.dependencies.workflow_repository.save(child)
+    services.dependencies.workflow_repository.save(parent)
+
+    deleted_item_ids = services.delete_item_ids(parent.normalized_item.id)
+
+    assert deleted_item_ids == [parent.normalized_item.id, child.normalized_item.id]
+    assert services.get_item(parent.normalized_item.id) is None
+    assert services.get_item(child.normalized_item.id) is None
+    assert not parent_path.exists()
+    assert not child_path.exists()
+
+
 def test_items_can_be_batch_analyzed_with_stored_raw_content(tmp_path, monkeypatch) -> None:
     """Batch analysis should use selected cards and keep the original raw content available."""
 

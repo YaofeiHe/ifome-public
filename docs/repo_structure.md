@@ -39,7 +39,7 @@
 
 - `services.py` 不只是把请求转发给工作流
 - 它还负责 submission analysis、prompt 标准化、画像引导的主题识别、one-shot 搜索扩词、显式搜索参考注入、section split、role variant expand、长公告 campaign card 推断、平台无关关系标签生成、抓取计划生成、逐链接访问判断、低上下文链接强制抓取、附件与本地文件先转文本、市场信息刷新和候选卡片编排
-- 现在市场信息刷新里又多了一层“基础网址 -> 站点级标题抓取或站点专用搜索适配器 -> 关键词规则排序并保留 1 篇探索项 -> 按记忆配置的文章上限抓正文 -> 大卡片/小卡片组织 -> 去重/历史清理”的编排
+- 现在市场信息刷新里又多了一层“基础网址 -> 站点级标题抓取或站点专用搜索适配器 -> LLM/关键词融合排序 -> 取记忆配置的 Top N 标题抓正文 -> 大卡片/小卡片组织 -> 去重/历史清理”的编排
 - 当标题搜索层拿不到结果时，`services.py` 还会回退到来源站点首页抓取，保证市场刷新仍然有可用产出
 - 所以多岗位合集输入的应用层 orchestration 主要落在这里，而不是放进前端或持久化层
 - 新增的批量卡片分析接口也在这里编排，因为它需要整合原文、标准化文本、标签和来源链接
@@ -48,8 +48,8 @@
 
 - `POST /ingest/auto`：统一文本 / 链接混合输入入口
 - `PATCH /items/{id}`：单卡片手动修改
-- `DELETE /items/{id}`：单卡片删除
-- `POST /items/batch-delete`：批量删除所选卡片
+- `DELETE /items/{id}`：单卡片删除；如果删除 overview 大卡，会级联删除它的小卡片和不再被引用的源文件
+- `POST /items/batch-delete`：批量删除所选卡片；响应会返回实际被删除的父/子 item ids
 - `GET /items/{id}`：左键点击卡片后读取完整详情
 - `POST /market/refresh`：手动或定时刷新市场信息卡
 
@@ -270,7 +270,7 @@
 面试时可以补一句：
 
 - `sqlite_workflows.py` 现在不只是“保存卡片”，还承担按用户 / workspace 过滤、单条删除等卡片管理边界
-- 批量删除能力在 service 层编排，保持 repository 仍然是简单稳定的持久化边界
+- 单卡 / 批量删除能力在 service 层编排，保持 repository 仍然是简单稳定的持久化边界；overview 删除会在 service 层展开小卡片并做源文件引用清理
 - 多岗位合集的拆卡与逐链接访问判断放在 service 层编排，而不是塞进 repository 或前端
 - “哪些卡该合并、哪些卡必须拆开”现在由 workflow + persist 节点共同决定，而不是由 repository 粗暴处理
 

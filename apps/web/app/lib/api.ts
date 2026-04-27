@@ -298,6 +298,11 @@ export type BatchDeleteItemsResponse = {
   missing_item_ids: string[];
 };
 
+export type DeleteItemResponse = {
+  item_id: string;
+  deleted_item_ids: string[];
+};
+
 export type BatchAnalyzeItemsResponse = {
   analysis: string;
   analyzed_item_ids: string[];

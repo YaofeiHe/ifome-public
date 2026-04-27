@@ -379,10 +379,10 @@ def update_item(item_id: str, payload: ItemUpdateRequest) -> ApiEnvelope:
 def delete_item(item_id: str) -> ApiEnvelope:
     """Delete one stored card and its reminders."""
 
-    deleted = services.delete_item(item_id)
-    if not deleted:
+    deleted_item_ids = services.delete_item_ids(item_id)
+    if not deleted_item_ids:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not found.")
-    return _ok(DeleteItemResponse(item_id=item_id))
+    return _ok(DeleteItemResponse(item_id=item_id, deleted_item_ids=deleted_item_ids))
 
 
 @app.post("/items/batch-delete", response_model=ApiEnvelope)

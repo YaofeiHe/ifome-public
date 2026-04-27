@@ -2761,12 +2761,12 @@ for path in renderedPaths {
                 return state
         return states[-1]
 
-    def delete_item(self, item_id: str) -> bool:
-        """Delete one stored item plus its reminders."""
+    def _collect_cascade_delete_states(self, item_id: str) -> list[AgentState]:
+        """Collect one item and any overview children that should be deleted together."""
 
         state = self.get_item(item_id)
         if state is None:
-            return False
+            return []
 
         states_to_delete: list[AgentState] = []
         pending_item_ids = [item_id]
@@ -2793,9 +2793,16 @@ for path in renderedPaths {
                 ]
                 if child_item_id not in seen_target_ids
             )
+        return states_to_delete
+
+    def delete_item_ids(self, item_id: str) -> list[str]:
+        """Delete one stored item tree and return every item id actually removed."""
+
+        states_to_delete = self._collect_cascade_delete_states(item_id)
+        if not states_to_delete:
+            return []
 
         archived_paths = self._collect_archived_paths_from_states(states_to_delete)
-        deleted = False
         deleted_item_ids: set[str] = set()
         for target_state in states_to_delete:
             target_item_id = (
@@ -2807,35 +2814,47 @@ for path in renderedPaths {
                 continue
             self.dependencies.reminder_queue.delete_for_item(target_item_id)
             deleted_current = self.dependencies.workflow_repository.delete(target_item_id)
-            deleted = deleted_current or deleted
             if deleted_current:
                 deleted_item_ids.add(target_item_id)
         if deleted_item_ids:
             self._remove_deleted_item_links_from_remaining_cards(deleted_item_ids)
-        if deleted and self.settings.source_files.delete_when_item_deleted:
+        if deleted_item_ids and self.settings.source_files.delete_when_item_deleted:
             self._delete_unreferenced_archived_paths(archived_paths)
-        return deleted
+        return [
+            target_state.normalized_item.id
+            for target_state in states_to_delete
+            if target_state.normalized_item is not None
+            and target_state.normalized_item.id in deleted_item_ids
+        ]
+
+    def delete_item(self, item_id: str) -> bool:
+        """Delete one stored item plus its reminders."""
+
+        return bool(self.delete_item_ids(item_id))
 
     def delete_items(self, item_ids: list[str]) -> tuple[list[str], list[str]]:
         """Delete multiple stored items and return deleted vs missing ids."""
 
         deleted_item_ids: list[str] = []
         missing_item_ids: list[str] = []
-        existing_item_ids: list[str] = []
         seen: set[str] = set()
+        deleted_seen: set[str] = set()
 
         for item_id in item_ids:
             if item_id in seen:
                 continue
             seen.add(item_id)
+            if item_id in deleted_seen:
+                continue
             if self.get_item(item_id) is None:
                 missing_item_ids.append(item_id)
                 continue
-            existing_item_ids.append(item_id)
-
-        for item_id in existing_item_ids:
-            if self.delete_item(item_id):
-                deleted_item_ids.append(item_id)
+            deleted_current = self.delete_item_ids(item_id)
+            for deleted_item_id in deleted_current:
+                if deleted_item_id in deleted_seen:
+                    continue
+                deleted_seen.add(deleted_item_id)
+                deleted_item_ids.append(deleted_item_id)
 
         return deleted_item_ids, missing_item_ids
 

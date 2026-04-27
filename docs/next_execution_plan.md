@@ -241,13 +241,15 @@ LLM 通用设置新增了一条硬约束：
 - 再结合 SQLite 历史卡片、可选向量召回和搜索参考组织 prompt
 - 如果 live LLM 可用，用 `market_watch_title_rank` 输出标题级 `llm_score`
 - 最终用 `llm_score + keyword_score + market_value_score + diversity_gap_score` 融合成总排行
-- 按设置里的 `market_article_fetch_limit` 选出正文抓取索引，再抓正文生成 article 子卡
+- 按设置里的 `market_article_fetch_limit` 选出正文抓取索引；默认是 Top 5，但不是取列表前 5，而是取融合排序后的前 5
 - overview 大卡继续汇总本轮来源，并挂载前 N 个子卡预览
 
 前端卡片列表修正：
 
 - 市场大卡的小卡预览不再直接用标题作为 React key
 - 后端修复旧卡回填时的重复 preview 和重复 child id，避免同标题或同子卡导致列表渲染重复或丢项
+- 删除 overview 大卡时，后端会级联删除其市场/岗位小卡，并删除这些卡片不再被引用的归档源文件
+- 删除 API 会返回本次实际删除的所有 item id，前端据此清理父卡、小卡、展开状态和选中状态
 
 输入页和聊天控制台的会话历史也统一了产品语义：
 
