@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.tools.recent_site_titles import fetch_recent_site_titles  # noqa: E402
+from core.tools.web_page_client import WebPageClient  # noqa: E402
 
 
 def main() -> int:
@@ -22,6 +23,12 @@ def main() -> int:
     parser.add_argument("site_url", help="Website base URL, for example https://www.jiqizhixin.com/")
     parser.add_argument("--hours", type=int, default=24, help="Lookback window in hours.")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of titles to keep.")
+    parser.add_argument(
+        "--fetch-top",
+        type=int,
+        default=0,
+        help="Fetch正文 diagnostics for the first N discovered titles.",
+    )
     parser.add_argument(
         "--pretty",
         action="store_true",
@@ -35,11 +42,40 @@ def main() -> int:
         limit=max(1, args.limit),
         now=datetime.now().astimezone(),
     )
+    fetched_details = []
+    if args.fetch_top > 0:
+        page_client = WebPageClient()
+        for item in results[: max(0, args.fetch_top)]:
+            try:
+                page = page_client.fetch(item.url)
+                fetched_details.append(
+                    {
+                        "title": item.title,
+                        "url": item.url,
+                        "ok": True,
+                        "page_title": page.title,
+                        "text_length": len(page.text),
+                        "fetch_method": page.source_metadata.get("fetch_method"),
+                        "published_at": page.source_metadata.get("published_at"),
+                        "text_preview": page.text[:240],
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - diagnostic CLI path
+                fetched_details.append(
+                    {
+                        "title": item.title,
+                        "url": item.url,
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+
     payload = {
         "site_url": args.site_url,
         "hours": max(1, args.hours),
         "count": len(results),
         "items": [asdict(item) for item in results],
+        "fetched_details": fetched_details,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
     return 0

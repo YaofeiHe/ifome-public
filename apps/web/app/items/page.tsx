@@ -113,13 +113,25 @@ function getOrderedChildCards(
     if (!child) {
       continue;
     }
+    if (explicitIds.has(child.item_id)) {
+      continue;
+    }
     explicitChildren.push(child);
     explicitIds.add(child.item_id);
   }
   const inferredChildren = (childrenByParent.get(item.item_id) || []).filter(
     (child) => !explicitIds.has(child.item_id),
   );
-  return [...explicitChildren, ...inferredChildren];
+  const orderedChildren: RenderedItemCard[] = [];
+  const orderedIds = new Set<string>();
+  for (const child of [...explicitChildren, ...inferredChildren]) {
+    if (orderedIds.has(child.item_id)) {
+      continue;
+    }
+    orderedChildren.push(child);
+    orderedIds.add(child.item_id);
+  }
+  return orderedChildren;
 }
 
 function collectRelatedItemIds(itemIds: string[], items: RenderedItemCard[]) {
@@ -303,6 +315,9 @@ export default function ItemsPage() {
         continue;
       }
       const current = mapping.get(item.job_parent_item_id) || [];
+      if (current.some((child) => child.item_id === item.item_id)) {
+        continue;
+      }
       current.push(item);
       mapping.set(item.job_parent_item_id, current);
     }
@@ -339,6 +354,9 @@ export default function ItemsPage() {
         continue;
       }
       const current = mapping.get(item.market_parent_item_id) || [];
+      if (current.some((child) => child.item_id === item.item_id)) {
+        continue;
+      }
       current.push(item);
       mapping.set(item.market_parent_item_id, current);
     }

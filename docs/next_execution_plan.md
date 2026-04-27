@@ -236,6 +236,7 @@ LLM 通用设置新增了一条硬约束：
 
 - 先用站点适配器抓标题列表，不直接抓正文
 - 机器之心优先走 `article_library` 标题 API，小脚本已验证可以导出最近 24 小时文章标题
+- 机器之心文章详情页本身会落到“数据服务”页，所以正文抓取优先访问 `article_library/articles/<slug>.json`
 - 标题候选先做关键词 / 用户画像规则分
 - 再结合 SQLite 历史卡片、可选向量召回和搜索参考组织 prompt
 - 如果 live LLM 可用，用 `market_watch_title_rank` 输出标题级 `llm_score`
@@ -246,7 +247,7 @@ LLM 通用设置新增了一条硬约束：
 前端卡片列表修正：
 
 - 市场大卡的小卡预览不再直接用标题作为 React key
-- 后端修复旧卡回填时的重复 preview，避免同标题文章导致列表渲染重复或丢项
+- 后端修复旧卡回填时的重复 preview 和重复 child id，避免同标题或同子卡导致列表渲染重复或丢项
 
 输入页和聊天控制台的会话历史也统一了产品语义：
 
@@ -445,8 +446,10 @@ LLM 通用设置新增了一条硬约束：
 同时保留一个明确边界：
 
 - 文章详情页 `https://www.jiqizhixin.com/articles/<slug>` 匿名访问时仍可能回到“数据服务”页
-- 所以机器之心当前是“列表层稳定可抓，详情层部分受限”
-- 已经通过“列表摘要回退落卡”规避这层限制
+- `https://www.jiqizhixin.com/api/article_library/articles/<slug>.json` 可以返回完整 HTML 正文
+- `WebPageClient` 已经对机器之心文章 URL 做专用适配，优先抓详情 JSON，再回退普通网页抓取
+- `scripts/market_watch_recent_titles.py` 新增 `--fetch-top N`，可以先输出标题，再抓前 N 篇正文做诊断
+- 2026-04-27 实测：标题列表可抓到 16 篇近 24 小时文章，前 5 篇正文均可通过详情 JSON 成功抓取
 - `共享规则`
 - `当前岗位片段`
 - `链接解析结果`

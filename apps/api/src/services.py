@@ -2291,7 +2291,11 @@ for path in renderedPaths {
 
             ordered_titles: list[str] = []
             seen_ordered_titles: set[str] = set()
-            child_ids = list(state.render_card.market_child_item_ids or [])
+            child_ids = list(dict.fromkeys(state.render_card.market_child_item_ids or []))
+            if child_ids != list(state.render_card.market_child_item_ids or []):
+                state.render_card.market_child_item_ids = child_ids
+                state.source_metadata["market_child_item_ids"] = child_ids
+                self.dependencies.workflow_repository.save(state)
             for child_id in child_ids:
                 child_state = next(
                     (
@@ -5838,6 +5842,8 @@ for path in renderedPaths {
             child_ids: list[str] = []
             for child_state in child_states:
                 if child_state.normalized_item is None or child_state.render_card is None:
+                    continue
+                if child_state.normalized_item.id in child_ids:
                     continue
                 child_ids.append(child_state.normalized_item.id)
                 child_state.source_metadata["market_parent_item_id"] = parent_item_id

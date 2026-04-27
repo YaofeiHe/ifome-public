@@ -183,7 +183,8 @@ OCR 顺序：
 
 - 后端回填 preview 时会去重
 - 前端渲染 key 不再只使用标题文本
-- 避免同名标题触发 React duplicate key 报错
+- 父卡 child id 也会去重，避免同一子卡被显式挂载和反向推断各渲染一次
+- 避免同名标题或同一 `item_id` 触发 React duplicate key 报错
 
 ### 11. LLM 调用统一带当前时间戳
 
@@ -200,10 +201,12 @@ OCR 顺序：
 市场刷新现在先抓标题列表，再决定抓哪些正文：
 
 - 机器之心优先从 `article_library` API 获取近 24 小时标题
+- 机器之心正文抓取优先从 `article_library/articles/<slug>.json` 获取完整 HTML 正文
 - 标题先按用户画像关键词、市场价值词和探索价值打规则分
 - 如果 live LLM 可用，再用 `market_watch_title_rank` 做标题级评分
 - prompt 会带入用户画像词、关键词分、市场价值分，以及历史卡片 / 向量召回参考
 - 最终排行融合 LLM 分和关键词分，选出设置里配置数量的标题再抓正文
+- 小脚本支持 `--fetch-top N`，可直接验证“标题列表 + 前 N 篇正文”两段链路
 
 ### 10. 源文件也进入了统一管理
 

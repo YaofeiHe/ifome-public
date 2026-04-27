@@ -240,13 +240,14 @@
 - `core/tools/embedding_client.py`：DashScope embedding 适配器。
 - `core/tools/prompt_loader.py`：Prompt 读取器。
 - `core/tools/search_client.py`：one-shot web search 适配器，用于在画像引导主题识别之后扩公司 / 业务线关键词，也用于发现市场监控源最近 24 小时的标题/链接候选；当前不能保证抓到站点“全部”文章，只能消费搜索结果返回的候选集合。
-- `core/tools/web_page_client.py`：网页正文抓取器，会识别站点验证页 / 拦截页，避免把无效正文送入工作流，并尽量提取文章来源发布时间。
+- `core/tools/web_page_client.py`：网页正文抓取器，会识别站点验证页 / 拦截页，避免把无效正文送入工作流，并尽量提取文章来源发布时间；机器之心文章页会优先走 `article_library/articles/<slug>.json` 详情 API。
 - `core/tools/recent_site_titles.py`：实验性的站点级近 24 小时标题发现器，按 `JSON-LD/listing pages -> feed -> sitemap -> homepage links` 顺序尝试直接从网站本身抓标题和链接；目前已经正式接入量子位，也已经给机器之心接上 `article_library` 标题 API。
 - 机器之心这条链路现在的真实结构是：
   - 先从 `rss` / 数据服务页定位 `文章库` 入口
   - 再从前端 bundle 里确认 `article_library/articles.json` 列表 API
   - 用这个 API 导出近 24 小时标题和发布时间
-  - 如果详情页匿名抓取失败，就先用 API 自带摘要回退生成市场子卡
+  - 正文抓取不直接访问 `/articles/<slug>`，而是走 `article_library/articles/<slug>.json`
+  - 如果详情 JSON 也失败，才先用列表 API 自带摘要回退生成市场子卡
 - `prompts/market_watch_title_rank.md`：市场文章标题级筛选 prompt；live LLM 可用时会结合画像关键词、规则分、历史卡片 / 向量召回参考输出 `llm_score`，再与关键词分融合排序。
 - `prompts/market_watch_overview.md`：固定来源标题列表的大卡片总览 prompt。
 - `core/tools/vector_store.py`：Qdrant REST vector store 适配器。
