@@ -368,13 +368,19 @@ def _run_sync_public(args: argparse.Namespace) -> int:
 def _run_git_command(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run one git command inside the exported public repository."""
 
-    return subprocess.run(
+    completed = subprocess.run(
         command,
         cwd=cwd,
-        check=True,
         text=True,
         capture_output=True,
     )
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(
+            f"git command failed with exit {completed.returncode}: "
+            f"{details or 'no git output'}"
+        )
+    return completed
 
 
 def _resolve_github_token(args: argparse.Namespace) -> str | None:
