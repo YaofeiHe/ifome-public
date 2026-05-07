@@ -932,7 +932,7 @@ LLM 通用设置新增了一条硬约束：
 
 - 中文 OCR 增强
 - 网页正文抽取增强
-- Boss 直聘真实自动化读取
+- Boss 直聘只读搜索结果的源信息整理、归档结构和卡片显示优化
 - 分类后的二级抽取 schema
 - reranker 接入
 - retrieval evaluation / 回放测试
