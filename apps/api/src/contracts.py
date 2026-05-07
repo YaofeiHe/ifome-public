@@ -171,6 +171,25 @@ class BossZhipinConversationIngestRequest(BaseModel):
     )
 
 
+class BossZhipinReadOnlySearchRequest(BaseModel):
+    """Payload for read-only Boss MCP search ingestion."""
+
+    user_id: str = Field(default="demo_user", description="Logical user identifier.")
+    workspace_id: str | None = Field(default="demo_workspace")
+    query: str = Field(description="Boss 搜索关键词。")
+    city: str | None = Field(default=None, description="城市筛选，例如 上海。")
+    salary: str | None = Field(default=None, description="薪资筛选。")
+    experience: str | None = Field(default=None, description="经验筛选。")
+    education: str | None = Field(default=None, description="学历筛选。")
+    page: int = Field(default=1, ge=1, description="搜索页码。")
+    max_items: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="最多写入 ifome 的职位条数；首期限制为低频小批量。",
+    )
+
+
 class ItemListResponse(BaseModel):
     """List payload for `GET /items`."""
 

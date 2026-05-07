@@ -337,9 +337,17 @@ export async function apiRequest<T>(
     cache: "no-store",
   });
 
-  const payload = (await response.json()) as ApiEnvelope<T>;
+  const payload = (await response.json()) as ApiEnvelope<T> & {
+    detail?: string;
+    message?: string;
+  };
   if (!response.ok || !payload.success) {
-    throw new Error(payload.error || `Request failed: ${response.status}`);
+    throw new Error(
+      payload.error ||
+        payload.detail ||
+        payload.message ||
+        `Request failed: ${response.status}`,
+    );
   }
   return payload;
 }

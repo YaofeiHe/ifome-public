@@ -20,6 +20,9 @@ dependencies = [
 ifome = "core.cli:main"
 
 [project.optional-dependencies]
+boss = [
+  "boss-agent-cli[mcp]",
+]
 dev = [
   "pytest",
   "httpx",

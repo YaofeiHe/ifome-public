@@ -4,6 +4,7 @@ import { ReactNode } from "react";
 
 import { AppNav } from "./components/app-nav";
 import { MarketRefreshBootstrap } from "./components/market-refresh-bootstrap";
+import { ShutdownButton } from "./components/shutdown-button";
 
 export const metadata: Metadata = {
   title: "ifome Job Agent",
@@ -25,7 +26,10 @@ export default function RootLayout({ children }: RootLayoutProps) {
               <p className="eyebrow">ifome</p>
               <p className="brand-copy">单 Agent 求职信息流控制台</p>
             </div>
-            <AppNav />
+            <div className="site-header-actions">
+              <AppNav />
+              <ShutdownButton />
+            </div>
           </header>
           {children}
         </div>

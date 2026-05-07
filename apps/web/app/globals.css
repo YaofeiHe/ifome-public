@@ -80,6 +80,14 @@ button {
   gap: 10px;
 }
 
+.site-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .nav-link {
   padding: 10px 14px;
   border-radius: 999px;
@@ -99,6 +107,36 @@ button {
 .nav-link-active {
   background: var(--accent);
   color: #fff8ef;
+}
+
+.shutdown-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid rgba(159, 47, 47, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 244, 244, 0.9);
+  color: var(--danger);
+  box-shadow: none;
+  transition:
+    background-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease,
+    border-color 160ms ease;
+}
+
+.shutdown-button:hover:not(:disabled) {
+  background: rgba(255, 233, 233, 0.98);
+  color: #7f2424;
+  border-color: rgba(159, 47, 47, 0.44);
+  transform: translateY(-1px);
+}
+
+.shutdown-button:disabled {
+  opacity: 0.7;
+  cursor: wait;
 }
 
 .dashboard-grid {

@@ -5,8 +5,9 @@ from __future__ import annotations
 from argparse import Namespace
 import os
 from pathlib import Path
+import threading
 
-from core.cli import _run_sync_public
+from core.cli import _run_install_boss, _run_sync_public, _watch_stdin_for_stop_command
 from core.runtime.env import load_local_env
 
 
@@ -69,3 +70,47 @@ def test_sync_public_copies_manifest_files_and_prunes_stale(tmp_path: Path) -> N
 
     assert (target_dir / "README.md").exists()
     assert not (target_dir / "core" / "logic.py").exists()
+
+
+def test_watch_stdin_for_stop_command_triggers_shutdown(monkeypatch) -> None:
+    """Typing `ifome stop` in the same terminal should trigger a shutdown request."""
+
+    calls: list[tuple[str, int]] = []
+    event = threading.Event()
+
+    class FakeStdin:
+        def isatty(self) -> bool:
+            return True
+
+        def __iter__(self):
+            yield "ifome stop\n"
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+    monkeypatch.setattr(
+        "core.cli._request_runtime_shutdown",
+        lambda host, api_port: (calls.append((host, api_port)), event.set()),
+    )
+
+    thread = _watch_stdin_for_stop_command("127.0.0.1", 8000)
+
+    assert thread is not None
+    assert event.wait(timeout=2)
+    assert calls == [("127.0.0.1", 8000)]
+
+
+def test_install_boss_runs_optional_dependency_setup(monkeypatch) -> None:
+    """The Boss installer should install the optional CLI and browser runtime."""
+
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "core.cli._run_checked_command",
+        lambda command, cwd, env: commands.append(command),
+    )
+    monkeypatch.setattr("core.cli._resolve_executable_near_python", lambda name: "patchright")
+
+    result = _run_install_boss(Namespace(skip_browser_install=False))
+
+    assert result == 0
+    assert commands[0][-3:] == ["pip", "install", "boss-agent-cli[mcp]"]
+    assert commands[1] == ["patchright", "install", "chromium"]

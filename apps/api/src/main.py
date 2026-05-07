@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import asyncio
+import os
+import signal
+from contextlib import asynccontextmanager
+
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -16,6 +21,7 @@ from apps.api.src.contracts import (
     BatchDeleteItemsResponse,
     BossZhipinConversationIngestRequest,
     BossZhipinJobIngestRequest,
+    BossZhipinReadOnlySearchRequest,
     CareerStateMemoryWriteRequest,
     ChatCitation,
     ChatAttachmentDiagnostic,
@@ -51,13 +57,21 @@ from apps.api.src.services import (
     build_career_state_from_write_request,
     build_profile_memory_from_write_request,
 )
+from integrations.boss_zhipin import BossMCPReadOnlyError
 from core.memory.experimental import ProjectSelfMemoryPayload
 from core.schemas import MemoryWriteMode, SourceType
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    services.cleanup_boss_login_state()
+
 
 app = FastAPI(
     title="ifome Job Agent API",
     description="Lightweight API scaffold for the job information flow agent.",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -185,7 +199,8 @@ async def ingest_unified(
             (file.filename or "upload.bin", await file.read())
             for file in files
         ]
-        analysis, states, attachments, resolved_paths = services.ingest_unified(
+        analysis, states, attachments, resolved_paths = await asyncio.to_thread(
+            services.ingest_unified,
             content=content,
             uploaded_files=uploaded_files,
             user_id=user_id,
@@ -241,6 +256,29 @@ def ingest_boss_zhipin_job(payload: BossZhipinJobIngestRequest) -> ApiEnvelope:
     return _ok(result, trace_id=state.trace_id)
 
 
+@app.post("/integrations/boss-zhipin/search-readonly", response_model=ApiEnvelope)
+def ingest_boss_zhipin_search_readonly(
+    payload: BossZhipinReadOnlySearchRequest,
+) -> ApiEnvelope:
+    """Search Boss through the read-only MCP tool subset and ingest job cards."""
+
+    try:
+        result = services.ingest_boss_search_readonly(
+            query=payload.query,
+            city=payload.city,
+            salary=payload.salary,
+            experience=payload.experience,
+            education=payload.education,
+            page=payload.page,
+            max_items=payload.max_items,
+            user_id=payload.user_id,
+            workspace_id=payload.workspace_id,
+        )
+    except BossMCPReadOnlyError as exc:
+        raise HTTPException(status_code=424, detail=str(exc)) from exc
+    return _ok(result)
+
+
 @app.post("/integrations/boss-zhipin/conversation", response_model=ApiEnvelope)
 def ingest_boss_zhipin_conversation(
     payload: BossZhipinConversationIngestRequest,
@@ -261,6 +299,21 @@ def ingest_boss_zhipin_conversation(
         model_routing=state.model_routing,
     )
     return _ok(result, trace_id=state.trace_id)
+
+
+def _shutdown_ifome_after_response() -> None:
+    """Exit the API process after the response has been sent."""
+
+    services.cleanup_boss_login_state()
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+@app.post("/runtime/shutdown", response_model=ApiEnvelope)
+def shutdown_runtime(background_tasks: BackgroundTasks) -> ApiEnvelope:
+    """Stop the local ifome runtime after clearing Boss login state."""
+
+    background_tasks.add_task(_shutdown_ifome_after_response)
+    return _ok({"status": "shutting_down"})
 
 
 @app.post("/ingest/image", response_model=ApiEnvelope)

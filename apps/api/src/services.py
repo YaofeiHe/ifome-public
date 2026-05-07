@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+import json
+import os
 import shutil
 import subprocess
 import re
+import sys
 import tempfile
+from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -58,12 +62,17 @@ from core.tools import (
     fetch_recent_site_titles,
 )
 from integrations.boss_zhipin import (
+    BossMCPReadOnlyError,
+    BossZhipinMCPReadOnlyClient,
     BossZhipinConversationPayload,
     BossZhipinJobPayload,
     render_conversation_metadata,
     render_conversation_text,
     render_job_posting_metadata,
     render_job_posting_text,
+    search_envelope_to_job_payloads,
+    search_item_identity,
+    search_item_to_job_payload,
 )
 
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
@@ -172,6 +181,8 @@ TEXT_FILE_SUFFIXES = {
 }
 DOCUMENT_FILE_SUFFIXES = TEXT_FILE_SUFFIXES | {".pdf"}
 SOURCE_ARCHIVE_ROOT = Path("data/runtime/source_files")
+BOSS_SEARCH_DEFAULT_MAX_ITEMS_PER_KEYWORD = 2
+BOSS_SEARCH_MAX_KEYWORDS = 4
 RESUME_FILE_NAME_PATTERN = re.compile(r"(resume|cv|简历)", re.IGNORECASE)
 RESUME_SECTION_MARKERS = (
     "教育经历",
@@ -266,6 +277,17 @@ class SubmissionAnalysis:
     should_visit_links: bool
     reasons: list[str]
     keyword_hints: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BossSearchInstruction:
+    """Read-only Boss search instruction parsed from a natural-language input."""
+
+    keywords: list[str]
+    city: str | None = None
+    raw_keywords: list[str] = field(default_factory=list)
+    required_keyword: str | None = None
+    max_items_per_keyword: int = BOSS_SEARCH_DEFAULT_MAX_ITEMS_PER_KEYWORD
 
 
 @dataclass(frozen=True)
@@ -396,6 +418,8 @@ class ApiServiceContainer:
     project_self_memory_service: ProjectSelfMemoryService = field(
         default_factory=ProjectSelfMemoryService
     )
+    _boss_login_recovery_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _boss_login_recovery_launched: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.runtime_overrides = self.runtime_settings_repository.load()
@@ -1612,6 +1636,15 @@ class ApiServiceContainer:
         attachment_summaries: list[dict[str, Any]] = []
         resolved_paths = [str(path) for path in local_paths]
 
+        boss_instruction = self._parse_boss_search_instruction(inline_content)
+        if boss_instruction and not local_paths and not uploaded_files:
+            analysis, boss_states = self.ingest_boss_search_instruction(
+                instruction=boss_instruction,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            return analysis, boss_states, attachment_summaries, resolved_paths
+
         if inline_content:
             analysis, inline_states = self.ingest_auto(
                 content=inline_content,
@@ -1701,6 +1734,64 @@ class ApiServiceContainer:
             keyword_hints=merged_keywords,
         )
         return merged_analysis, states, attachment_summaries, resolved_paths
+
+    def _parse_boss_search_instruction(self, content: str) -> BossSearchInstruction | None:
+        """Detect the narrow natural-language Boss search command used by the input UI."""
+
+        text = re.sub(r"\s+", " ", content or "").strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if "boss" not in lowered and "直聘" not in text:
+            return None
+        if not any(marker in text for marker in ("搜索", "查找", "检索", "找")):
+            return None
+
+        quoted_matches = re.findall(r"[“\"']([^“”\"']{2,160})[”\"']", text)
+        keyword_text = ""
+        if quoted_matches:
+            keyword_text = quoted_matches[-1]
+        else:
+            keyword_match = re.search(r"关键词[:：]?\s*(.+)", text)
+            if keyword_match:
+                keyword_text = keyword_match.group(1)
+            else:
+                for marker in ("有关", "关于"):
+                    if marker in text:
+                        keyword_text = text.split(marker, 1)[1]
+                        break
+
+        keyword_text = re.sub(r"(的)?有关(的)?内容.*$", "", keyword_text).strip()
+        keyword_text = re.sub(r"(岗位|职位|内容|信息)$", "", keyword_text).strip()
+        if not keyword_text:
+            keyword_text = text
+
+        raw_keywords = re.split(r"\s*(?:/|／|、|，|,|；|;|\|)\s*", keyword_text)
+        keywords: list[str] = []
+        for raw_keyword in raw_keywords:
+            keyword = raw_keyword.strip(" ：:。.!?？")
+            if not keyword or keyword in {"boss直聘", "Boss直聘", "BOSS直聘"}:
+                continue
+            if keyword.startswith("有关关键词"):
+                keyword = keyword.replace("有关关键词", "", 1).strip(" ：:")
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+
+        if not keywords:
+            return None
+
+        city = None
+        for location in KNOWN_LOCATION_TERMS:
+            if location != "远程" and location in text:
+                city = location
+                break
+        return BossSearchInstruction(
+            keywords=keywords[:BOSS_SEARCH_MAX_KEYWORDS],
+            city=city,
+            raw_keywords=keywords[:BOSS_SEARCH_MAX_KEYWORDS],
+            required_keyword=None,
+            max_items_per_keyword=BOSS_SEARCH_DEFAULT_MAX_ITEMS_PER_KEYWORD,
+        )
 
     def ingest_image_file(
         self,
@@ -2961,12 +3052,16 @@ for path in renderedPaths {
         user_id: str,
         workspace_id: str | None,
         memory_write_mode: MemoryWriteMode = MemoryWriteMode.CONTEXT_ONLY,
+        extra_source_metadata: dict[str, Any] | None = None,
     ) -> AgentState:
         """Ingest one Boss 直聘岗位详情 payload through the shared workflow."""
 
         source_ref = f"boss_zhipin:job:{payload.job_id}"
         if payload.job_url:
             source_ref = payload.job_url
+        source_metadata = render_job_posting_metadata(payload)
+        if extra_source_metadata:
+            source_metadata.update(extra_source_metadata)
         return self.ingest(
             raw_input=render_job_posting_text(payload),
             source_type=SourceType.TEXT,
@@ -2974,8 +3069,466 @@ for path in renderedPaths {
             workspace_id=workspace_id,
             source_ref=source_ref,
             memory_write_mode=memory_write_mode,
-            source_metadata=render_job_posting_metadata(payload),
+            source_metadata=source_metadata,
         )
+
+    def ingest_boss_search_readonly(
+        self,
+        *,
+        query: str,
+        city: str | None,
+        salary: str | None,
+        experience: str | None,
+        education: str | None,
+        page: int,
+        max_items: int,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> dict[str, Any]:
+        """Search Boss through the read-only MCP client and ingest returned jobs."""
+
+        client = BossZhipinMCPReadOnlyClient(command=self._resolve_boss_mcp_command())
+        try:
+            envelope = self._search_boss_jobs_with_login_recovery(
+                client=client,
+                query=query,
+                city=city,
+                salary=salary,
+                experience=experience,
+                education=education,
+                page=page,
+            )
+            payloads = search_envelope_to_job_payloads(envelope, max_items=max_items)
+        except BossMCPReadOnlyError as exc:
+            raise BossMCPReadOnlyError(self._format_boss_readonly_error(str(exc))) from exc
+
+        states: list[AgentState] = []
+        for payload in payloads:
+            states.append(
+                self.ingest_boss_job(
+                    payload=payload,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    memory_write_mode=MemoryWriteMode.CONTEXT_ONLY,
+                )
+            )
+
+        if states:
+            with self._boss_login_recovery_lock:
+                self._boss_login_recovery_launched = False
+
+        return {
+            "query": query,
+            "city": city,
+            "page": page,
+            "boss_result_count": len(envelope.get("data") or []),
+            "ingested_count": len(states),
+            "item_ids": [
+                state.normalized_item.id
+                for state in states
+                if state.normalized_item is not None
+            ],
+            "cards": [state.render_card for state in states if state.render_card is not None],
+            "boss_pagination": envelope.get("pagination"),
+            "memory_write_mode": MemoryWriteMode.CONTEXT_ONLY.value,
+            "readonly_tools": sorted(client.allowed_tools),
+        }
+
+    def ingest_boss_search_instruction(
+        self,
+        *,
+        instruction: BossSearchInstruction,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> tuple[SubmissionAnalysis, list[AgentState]]:
+        """Run a natural-language Boss search instruction and archive results as company groups."""
+
+        command = self._resolve_boss_mcp_command()
+        client = BossZhipinMCPReadOnlyClient(command=command)
+        raw_items: list[dict[str, Any]] = []
+        seen_identities: set[str] = set()
+
+        for keyword in instruction.keywords:
+            envelope = self._search_boss_jobs_with_login_recovery(
+                client=client,
+                query=keyword,
+                city=instruction.city,
+                salary=None,
+                experience=None,
+                education=None,
+                page=1,
+            )
+            for item in envelope.get("data") or []:
+                if not isinstance(item, dict):
+                    continue
+                identity = search_item_identity(item)
+                if identity and identity in seen_identities:
+                    current_keywords = item.setdefault("ifome_search_keywords", [])
+                    if keyword not in current_keywords:
+                        current_keywords.append(keyword)
+                    continue
+                if identity:
+                    seen_identities.add(identity)
+                item["ifome_search_keywords"] = [keyword]
+                raw_items.append(item)
+
+        max_total = max(1, instruction.max_items_per_keyword * max(1, len(instruction.keywords)))
+        selected_items = raw_items[:max_total]
+        child_states: list[AgentState] = []
+        for item in selected_items:
+            payload = search_item_to_job_payload(item)
+            item_keywords = [
+                str(value).strip()
+                for value in item.get("ifome_search_keywords", [])
+                if str(value).strip()
+            ] or instruction.keywords
+            role_variant = str(item.get("title") or payload.role_title).strip()
+            semantic_tags = list(
+                dict.fromkeys(
+                    [
+                        "Boss直聘",
+                        "Boss搜索",
+                        *item_keywords,
+                        *(payload.tags or [])[:6],
+                    ]
+                )
+            )[:12]
+            child_state = self.ingest_boss_job(
+                payload=payload,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                memory_write_mode=MemoryWriteMode.CONTEXT_ONLY,
+                extra_source_metadata={
+                    "source_title": f"{payload.company_name}-{payload.role_title}",
+                    "detected_input_kind": "boss_search_instruction",
+                    "boss_search_keywords": item_keywords,
+                    "keyword_hints": item_keywords,
+                    "semantic_tags": semantic_tags,
+                    "relationship_tags": semantic_tags,
+                    "relationship_family": payload.company_name,
+                    "primary_unit": payload.company_name,
+                    "identity_tag": payload.company_name,
+                    "role_variant": role_variant,
+                    "skip_relationship_reorg": True,
+                    "boss_security_id": item.get("security_id"),
+                    "boss_encrypt_job_id": item.get("job_id"),
+                    "boss_search_city": instruction.city,
+                },
+            )
+            child_states.append(child_state)
+
+        grouped_states = self._group_boss_search_states_by_company(
+            child_states=child_states,
+            instruction=instruction,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        states = [*child_states, *grouped_states]
+        if states:
+            with self._boss_login_recovery_lock:
+                self._boss_login_recovery_launched = False
+        analysis = SubmissionAnalysis(
+            input_kind="boss_search_instruction",
+            context_text=" / ".join(instruction.raw_keywords or instruction.keywords),
+            urls=[],
+            should_visit_links=False,
+            reasons=[
+                "detected read-only Boss search instruction",
+                f"searched {len(instruction.keywords)} Boss keywords through MCP",
+                f"limited Boss search to {instruction.max_items_per_keyword} items per keyword",
+                (
+                    f"applied required Boss search keyword: {instruction.required_keyword}"
+                    if instruction.required_keyword
+                    else "no required Boss search keyword"
+                ),
+                f"ingested {len(child_states)} Boss job cards",
+                f"grouped into {len(grouped_states)} company overview cards",
+                "Boss write tools remained blocked by read-only MCP whitelist",
+            ],
+            keyword_hints=instruction.raw_keywords or instruction.keywords,
+        )
+        return analysis, states
+
+    def _format_boss_readonly_error(self, message: str) -> str:
+        """Keep Boss safety-check errors actionable without suggesting bypasses."""
+
+        if any(marker in message for marker in ("风控", "异常行为", "验证码", "安全检查", "访问受限")):
+            self._trigger_boss_login_recovery_once()
+            return (
+                "Boss 直聘返回风控或安全检查，ifome 已停止只读搜索，并已尝试清理旧登录态并唤起登录界面。"
+                "请完成 Boss 官方扫码登录后重新发起搜索；系统不会尝试绕过验证码或安全限制。"
+            )
+        return message
+
+    def _boss_cli_json(self, *args: str) -> dict[str, Any]:
+        """Run the boss CLI with JSON output and decode it."""
+
+        command = self._resolve_boss_cli_command()
+        completed = subprocess.run(
+            [command, "--json", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=45,
+        )
+        payload_text = (completed.stdout or completed.stderr or "").strip()
+        if not payload_text:
+            raise BossMCPReadOnlyError("boss CLI did not return any JSON output.")
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            raise BossMCPReadOnlyError("boss CLI returned non-JSON output.") from exc
+        if not isinstance(payload, dict):
+            raise BossMCPReadOnlyError("boss CLI returned an unexpected payload.")
+        return payload
+
+    def _resolve_boss_cli_command(self) -> str:
+        command = os.getenv("IFOME_BOSS_CLI_COMMAND") or shutil.which("boss")
+        if not command:
+            candidate = Path(sys.executable).with_name("boss")
+            if candidate.exists():
+                command = str(candidate)
+        if not command:
+            raise BossMCPReadOnlyError(
+                "boss executable was not found. Install boss-agent-cli in the runtime environment "
+                "or set IFOME_BOSS_CLI_COMMAND."
+            )
+        return command
+
+    def _ensure_boss_login_ready(self) -> None:
+        """Open boss login when the local session is missing or expired."""
+
+        try:
+            status = self._boss_cli_json("status")
+        except Exception:
+            self._trigger_boss_login_recovery_once()
+            return
+
+        data = status.get("data") or {}
+        if isinstance(data, dict) and data.get("logged_in"):
+            with self._boss_login_recovery_lock:
+                self._boss_login_recovery_launched = False
+            return
+
+        error = status.get("error") or {}
+        code = str(error.get("code") or "").upper()
+        if code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}:
+            self._trigger_boss_login_recovery_once()
+            return
+
+        if not code and not data:
+            self._trigger_boss_login_recovery_once()
+
+    def _is_boss_auth_error(self, message: str) -> bool:
+        """Return whether one Boss error indicates a stale or missing login session."""
+
+        normalized = message.lower()
+        return any(
+            marker in message
+            for marker in (
+                "未登录",
+                "登录过期",
+                "请先执行 boss login",
+                "AUTH_REQUIRED",
+                "AUTH_EXPIRED",
+                "TOKEN_REFRESH_FAILED",
+            )
+        ) or "auth" in normalized
+
+    def _search_boss_jobs_with_login_recovery(
+        self,
+        *,
+        client: BossZhipinMCPReadOnlyClient,
+        query: str,
+        city: str | None,
+        salary: str | None,
+        experience: str | None,
+        education: str | None,
+        page: int,
+    ) -> dict[str, Any]:
+        """Call boss_search, retrying once after login recovery on auth failures."""
+
+        self._ensure_boss_login_ready()
+        last_error: BossMCPReadOnlyError | None = None
+        for attempt in range(2):
+            envelope = client.search_jobs(
+                query=query,
+                city=city,
+                salary=salary,
+                experience=experience,
+                education=education,
+                page=page,
+            )
+            if envelope.get("ok"):
+                return envelope
+            error = envelope.get("error") or {}
+            message = str(error.get("message") or "Boss search failed.")
+            if self._is_boss_auth_error(message) and attempt == 0:
+                self._trigger_boss_login_recovery_once()
+                last_error = BossMCPReadOnlyError(message)
+                continue
+            raise BossMCPReadOnlyError(self._format_boss_readonly_error(message))
+        if last_error is not None:
+            raise last_error
+        raise BossMCPReadOnlyError("Boss search failed.")
+
+    def _trigger_boss_login_recovery_once(self) -> None:
+        """Clear the cached login state and launch `boss login` once per recovery cycle."""
+
+        with self._boss_login_recovery_lock:
+            if self._boss_login_recovery_launched:
+                return
+
+            boss_command = self._resolve_boss_cli_command()
+            try:
+                subprocess.run(
+                    [boss_command, "logout"],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except Exception as exc:
+                raise BossMCPReadOnlyError(f"Boss 直聘登录态重置失败: {exc}") from exc
+
+            try:
+                completed = subprocess.run(
+                    [boss_command, "login", "--timeout", "120"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=None,
+                    stderr=None,
+                    start_new_session=True,
+                    check=False,
+                    timeout=180,
+                )
+            except Exception as exc:
+                raise BossMCPReadOnlyError(f"Boss 直聘登录界面唤起失败: {exc}") from exc
+
+            if completed.returncode != 0:
+                raise BossMCPReadOnlyError("Boss 直聘登录未成功完成，请重新扫码后再试。")
+
+            self._boss_login_recovery_launched = True
+
+    def cleanup_boss_login_state(self) -> None:
+        """Clear local boss login state on ifome shutdown."""
+
+        try:
+            boss_command = self._resolve_boss_cli_command()
+        except BossMCPReadOnlyError:
+            return
+        try:
+            subprocess.run(
+                [boss_command, "logout"],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except Exception:
+            return
+        with self._boss_login_recovery_lock:
+            self._boss_login_recovery_launched = False
+
+    def _resolve_boss_mcp_command(self) -> str:
+        command = shutil.which("boss-mcp")
+        if not command:
+            candidate = Path(sys.executable).with_name("boss-mcp")
+            if candidate.exists():
+                command = str(candidate)
+        if not command:
+            raise BossMCPReadOnlyError(
+                "boss-mcp executable was not found. Install boss-agent-cli[mcp] "
+                "in the runtime environment, or run `ifome install-boss` once."
+            )
+        return command
+
+    def _group_boss_search_states_by_company(
+        self,
+        *,
+        child_states: list[AgentState],
+        instruction: BossSearchInstruction,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> list[AgentState]:
+        grouped: dict[str, list[AgentState]] = {}
+        for state in child_states:
+            company = ""
+            if state.extracted_signal is not None and state.extracted_signal.company:
+                company = state.extracted_signal.company
+            company = company or str(state.source_metadata.get("primary_unit") or "").strip()
+            if not company:
+                company = "未知公司"
+            grouped.setdefault(company, []).append(state)
+
+        overview_states: list[AgentState] = []
+        for company, company_children in grouped.items():
+            section = SubmissionSection(
+                section_title=f"{company} Boss搜索岗位合集",
+                section_text=self._compose_boss_search_company_section_text(
+                    company=company,
+                    keywords=instruction.keywords,
+                    child_states=company_children,
+                ),
+                urls=[],
+                semantic_tags=list(dict.fromkeys(["Boss直聘", "Boss搜索", *instruction.keywords, company])),
+                role_variants=[
+                    state.extracted_signal.role
+                    for state in company_children
+                    if state.extracted_signal is not None and state.extracted_signal.role
+                ],
+                relationship_family=company,
+                relationship_stage=None,
+                primary_unit=company,
+                identity_tag=company,
+            )
+            overview_state = self._build_job_group_overview_state(
+                section=section,
+                child_states=company_children,
+                shared_context=(
+                    "只读 Boss MCP 搜索结果。"
+                    f"搜索关键词：{' / '.join(instruction.keywords)}。"
+                    "该父卡按公司归档，子卡保留每个具体岗位。"
+                ),
+                shared_exam_dates=[],
+                next_shared_exam_date=None,
+                keyword_hints=instruction.keywords,
+                search_references=[],
+                user_id=user_id,
+                workspace_id=workspace_id,
+                memory_write_mode=MemoryWriteMode.CONTEXT_ONLY,
+                base_source_metadata={
+                    "connector": "boss_zhipin",
+                    "connector_entity": "boss_search_company_overview",
+                    "detected_input_kind": "boss_search_instruction",
+                    "boss_search_keywords": instruction.keywords,
+                    "keyword_hints": instruction.keywords,
+                    "skip_relationship_reorg": True,
+                },
+                source_type_override=SourceType.TEXT,
+                source_ref_override=f"boss_zhipin:search:{company}:{'|'.join(instruction.keywords)}",
+            )
+            overview_states.append(overview_state)
+        return overview_states
+
+    def _compose_boss_search_company_section_text(
+        self,
+        *,
+        company: str,
+        keywords: list[str],
+        child_states: list[AgentState],
+    ) -> str:
+        lines = [
+            f"Boss直聘公司岗位合集：{company}",
+            f"搜索关键词：{' / '.join(keywords)}",
+            f"岗位数量：{len(child_states)}",
+            "岗位子项：",
+        ]
+        for state in child_states:
+            if state.render_card is not None:
+                lines.append(f"- {state.render_card.summary_one_line}")
+        return "\n".join(lines)
 
     def ingest_boss_conversation(
         self,

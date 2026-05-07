@@ -276,18 +276,19 @@
 
 ## `integrations/` 接入层
 
-当前主要是目录占位，后续最重要的是：
+当前这层用于把外部平台数据收敛成 ifome 内部统一输入：
 
 - `boss_zhipin/`：读取 Boss 直聘岗位详情和 HR 对话内容
 - `email/`：邮件同步
 - `calendar/`：日历事件同步
 
-当前 `boss_zhipin/` 已经有第一版最小接入文件：
+当前 `boss_zhipin/` 已经有只读 Boss 接入文件：
 
 - `integrations/boss_zhipin/contracts.py`
 - `integrations/boss_zhipin/translator.py`
+- `integrations/boss_zhipin/mcp_readonly.py`
 
-这层的边界是“把外部平台数据转成内部统一输入”，而不是在这里做排序、提醒或聊天策略。
+这层的边界是“把外部平台数据转成内部统一输入”，而不是在这里做排序、提醒或聊天策略。Boss 直聘真实连接当前只开放 `boss_status`、`boss_search`、`boss_detail`、`boss_cities` 这类只读工具；聊天、投递、打招呼、交换联系方式和简历修改都保持禁止。
 
 ## `prompts/` Prompt 资产目录
 
@@ -319,14 +320,14 @@
 - 平台无关关系标签与批量卡片分析路径
 - prompt 库驱动的 intake standardize 与搜索扩词前置路径
 - SQLite workflow / memory 重启持久化
-- Boss 直聘岗位 / 对话最小接入路径
+- Boss 直聘岗位 / 对话 / 只读搜索接入路径
 - grounded chat / RAG 检索与引用路径
 - 卡片去重、覆盖、手动编辑、单条删除、批量删除
 
 后续会继续补：
 
 - live provider 适配层测试
-- Boss 直聘 connector 回放测试
+- Boss 直聘 connector 回放测试和搜索结果卡片归档优化测试
 - 小规模评测集
 
 ## 面试推荐讲法

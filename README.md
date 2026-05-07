@@ -175,6 +175,8 @@ ifome
 ```bash
 ifome --no-browser
 ifome --api-port 8100 --web-port 3100
+ifome install-boss
+ifome stop
 ```
 
 说明：
@@ -182,6 +184,17 @@ ifome --api-port 8100 --web-port 3100
 - 这条统一命令依赖本机已经安装 `Node.js` 和 `npm`
 - 如果你是从源码仓库运行，它会优先使用当前仓库里的 `apps/web`
 - 如果你是通过安装包运行，它会自动准备一份可运行的前端副本再启动
+- `ifome install-boss` 是可选步骤，会安装 `boss-agent-cli[mcp]` 和 Boss 登录/搜索所需的浏览器运行时；ifome 源码不会包含 `boss-agent-cli`
+- Boss 只读搜索会在调用前检查登录态；未登录或登录过期时唤起 Boss 官方扫码登录
+- 关闭 ifome 时，页眉右侧的关闭按钮和 `ifome stop` 都会先清理 Boss 登录态，再停止本地进程
+
+Boss 搜索的自然语言输入示例：
+
+```text
+请搜索boss直聘中有关关键词“AI 应用后端 / 智能体平台 / 开发者 AI / 数据与评测”的有关的内容
+```
+
+这条链路只允许读取职位搜索、详情和城市信息，会把结果整理成公司大卡片和岗位小卡片；不会操作 Boss 聊天、投递、简历修改或其他写入类功能。
 
 ## 公共仓库同步
 

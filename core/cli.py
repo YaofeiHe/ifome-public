@@ -16,6 +16,7 @@ import webbrowser
 import base64
 from importlib import resources
 from pathlib import Path
+from urllib.error import URLError
 
 
 PUBLIC_SYNC_STATE = ".ifome_public_sync_state.json"
@@ -143,6 +144,72 @@ def _run_checked_command(command: list[str], cwd: Path, env: dict[str, str]) -> 
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+def _request_runtime_shutdown(host: str, api_port: int) -> None:
+    """Ask the local API to shut down and clean up Boss login state."""
+
+    shutdown_url = f"http://{host}:{api_port}/runtime/shutdown"
+    print(f"[ifome] Requesting shutdown: {shutdown_url}", flush=True)
+    request = urllib.request.Request(shutdown_url, method="POST")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = response.read().decode("utf-8", errors="replace").strip()
+        if body:
+            print(body, flush=True)
+
+
+def _run_stop(args: argparse.Namespace) -> int:
+    """Ask the local API to shut down and clean up Boss login state."""
+
+    try:
+        _request_runtime_shutdown(args.host, args.api_port)
+    except URLError as exc:
+        raise RuntimeError(f"无法关闭 ifome：{exc}") from exc
+    return 0
+
+
+def _resolve_executable_near_python(name: str) -> str | None:
+    """Find one command in PATH or beside the active Python executable."""
+
+    command = shutil.which(name)
+    if command:
+        return command
+    candidate = Path(sys.executable).with_name(name)
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+def _run_install_boss(args: argparse.Namespace) -> int:
+    """Install the optional Boss read-only connector dependency."""
+
+    env = os.environ.copy()
+    install_command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "boss-agent-cli[mcp]",
+    ]
+    print("[ifome] Installing optional Boss connector: boss-agent-cli[mcp]", flush=True)
+    _run_checked_command(install_command, cwd=Path.cwd(), env=env)
+
+    if not args.skip_browser_install:
+        patchright = _resolve_executable_near_python("patchright")
+        if patchright is None:
+            raise RuntimeError(
+                "patchright executable was not found after installing boss-agent-cli[mcp]. "
+                "Please check the installation output and rerun `ifome install-boss`."
+            )
+        print("[ifome] Installing Patchright Chromium runtime for Boss login/search", flush=True)
+        _run_checked_command([patchright, "install", "chromium"], cwd=Path.cwd(), env=env)
+
+    print(
+        "[ifome] Boss connector is installed. Start ifome and enter a Boss search request; "
+        "if Boss is not logged in, ifome will launch the official QR login flow.",
+        flush=True,
+    )
+    return 0
+
+
 def _ensure_web_dependencies(web_dir: Path, env: dict[str, str]) -> None:
     """Install frontend dependencies once if `node_modules` is missing."""
 
@@ -165,6 +232,27 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def _watch_stdin_for_stop_command(host: str, api_port: int) -> threading.Thread | None:
+    """Listen for `ifome stop` on stdin when running in an interactive terminal."""
+
+    if not sys.stdin.isatty():
+        return None
+
+    def _reader() -> None:
+        for raw_line in sys.stdin:
+            line = raw_line.strip().lower()
+            if line == "ifome stop":
+                try:
+                    _request_runtime_shutdown(host, api_port)
+                except Exception as exc:
+                    print(f"[ifome] 无法通过 stdin 停止：{exc}", flush=True)
+                break
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    return thread
 
 
 def _run_start(args: argparse.Namespace) -> int:
@@ -253,6 +341,7 @@ def _run_start(args: argparse.Namespace) -> int:
         threading.Thread(target=_open_when_ready, daemon=True).start()
 
     processes = [backend, web]
+    stdin_watch_thread = _watch_stdin_for_stop_command(args.host, args.api_port)
 
     def _shutdown(*_unused: object) -> None:
         for process in processes:
@@ -270,6 +359,8 @@ def _run_start(args: argparse.Namespace) -> int:
                     if sibling is not process:
                         _terminate_process(sibling)
                 return code
+            if stdin_watch_thread is not None and not stdin_watch_thread.is_alive():
+                pass
             time.sleep(1)
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
@@ -468,6 +559,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="启动后不自动打开浏览器",
     )
     start_parser.set_defaults(handler=_run_start, open_browser=True)
+
+    stop_parser = subparsers.add_parser(
+        "stop",
+        help="关闭本地 ifome，并在退出前清理 Boss 登录态",
+    )
+    stop_parser.add_argument("--host", default="127.0.0.1")
+    stop_parser.add_argument("--api-port", type=int, default=8000)
+    stop_parser.set_defaults(handler=_run_stop)
+
+    install_boss_parser = subparsers.add_parser(
+        "install-boss",
+        help="安装可选 Boss 直聘只读连接器 boss-agent-cli[mcp]",
+    )
+    install_boss_parser.add_argument(
+        "--skip-browser-install",
+        action="store_true",
+        help="只安装 Python 依赖，不执行 patchright install chromium",
+    )
+    install_boss_parser.set_defaults(handler=_run_install_boss)
 
     sync_parser = subparsers.add_parser(
         "sync-public",

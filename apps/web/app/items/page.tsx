@@ -293,6 +293,7 @@ export default function ItemsPage() {
         item.priority,
         item.content_category,
         item.source_type,
+        ...item.tags,
       ]
         .filter(Boolean)
         .join(" ")
